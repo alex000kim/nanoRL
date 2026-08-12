@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+.misc/
+
+# nanoRL run artifacts
+runs/

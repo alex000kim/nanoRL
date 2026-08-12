@@ -1,0 +1,10 @@
+# Rung 3 — PPO on CartPole (critic + GAE + clipped surrogate). CPU, ~20s to solved (500).
+task: cartpole
+algo: ppo
+steps: 150
+n_prompts: 16
+group_size: 1
+inner_epochs: 4
+lr: 3.0e-3
+ent_coef: 0.01
+eval_every: 10

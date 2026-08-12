@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 300" font-family="system-ui,-apple-system,'Segoe UI',sans-serif">
+<rect width="880" height="300" fill="#FFFFFF"/>
+<defs><marker id="b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+  <path d="M0 0L10 5L0 10z" fill="#6B7280"/></marker></defs>
+
+<text x="30" y="34" fill="#1F2430" font-size="15" font-weight="600">Disaggregated async RL: one trainer, N rollout workers, stdlib HTTP between them</text>
+
+<rect x="30" y="60" width="330" height="200" rx="10" fill="#F3F4F6" stroke="#D1D5DB"/>
+<text x="50" y="88" fill="#1F2430" font-size="13" font-weight="600">trainer (GPU 0)</text>
+<text x="50" y="114" fill="#6B7280" font-size="12" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">pop batch (age &lt;= max_staleness)</text>
+<text x="50" y="136" fill="#3D6DE0" font-size="12" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">recompute old_logp @ version v</text>
+<text x="50" y="158" fill="#6B7280" font-size="12" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">advantage -&gt; clipped update</text>
+<text x="50" y="180" fill="#6B7280" font-size="12" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">publish LoRA adapter v+1</text>
+<rect x="50" y="198" width="290" height="44" rx="6" fill="#EAF0FD" stroke="#3D6DE0"/>
+<text x="60" y="216" fill="#1F2430" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">HTTP :8000  queue(max_staleness+1)</text>
+<text x="60" y="232" fill="#1F2430" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">adapter snapshots v-5..v</text>
+
+<rect x="560" y="60" width="290" height="88" rx="10" fill="#F3F4F6" stroke="#D1D5DB"/>
+<text x="580" y="88" fill="#1F2430" font-size="13" font-weight="600">rollout worker (GPU 1)</text>
+<text x="580" y="112" fill="#6B7280" font-size="12" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">vLLM generate, no backward</text>
+<text x="580" y="134" fill="#6B7280" font-size="12" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">reward = verifier fn</text>
+<rect x="572" y="166" width="290" height="88" rx="10" fill="#F3F4F6" stroke="#D1D5DB" opacity="0.55"/>
+<text x="592" y="194" fill="#1F2430" font-size="13" font-weight="600" opacity="0.7">rollout worker (GPU N)</text>
+<text x="592" y="218" fill="#6B7280" font-size="12" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" opacity="0.7">scale with num_nodes</text>
+
+<path d="M560 90 L370 90" stroke="#6B7280" stroke-width="1.5" marker-end="url(#b)"/>
+<text x="465" y="80" fill="#C9761F" font-size="12" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">POST batch @ v</text>
+<path d="M370 130 L560 130" stroke="#6B7280" stroke-width="1.5" marker-end="url(#b)"/>
+<text x="465" y="152" fill="#C9761F" font-size="12" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">GET adapter v+1</text>
+
+<text x="30" y="286" fill="#6B7280" font-size="12">Independent failure domains: a dead worker costs one in-flight batch; the trainer never waits on any single worker.</text>
+</svg>

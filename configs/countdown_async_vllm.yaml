@@ -1,0 +1,47 @@
+# Disaggregated async GRPO: vLLM rollout workers + HF trainer. Both roles read this file;
+# --role picks which half of the loop runs.
+#   sky jobs launch sky/jobgroup.yaml
+task: countdown
+algo: grpo
+# Gemma-4 cannot be used with --vllm (per-layer heterogeneous attention); Qwen3-8B loads fine.
+model: Qwen/Qwen3-8B
+
+# Per WORKER submission, not a global batch: the trainer trains on one submission per step,
+# so more workers raise batch frequency, not size. Small frequent batches keep staleness low.
+n_prompts: 8
+group_size: 8          # 64 sequences per submitted batch
+micro_batch: 4         # scoring: logits-bound
+gen_batch: 24          # trainer-side eval generation only; workers generate with vLLM
+
+# Staleness bound. Also sizes the rollout queue (max_staleness+1 batches) and snapshot
+# retention. Must exceed the trainer versions elapsed during one worker generation cycle,
+# or fresh work gets rejected. The trainer always recomputes old_logp under the sampling
+# version's weights; the residual worker-vs-trainer gap is logged as logp_gap.
+max_staleness: 4
+pop_timeout: 2400.0    # > one worker's FULL generation cycle (arrivals are bursty)
+serve_port: 8000
+
+lora: true             # also makes weight sync cheap: adapters only
+lora_r: 32
+grad_ckpt: true
+dtype: bfloat16
+device: cuda
+
+steps: 200             # workers exit when the version reaches this
+inner_epochs: 1
+lr: 5.0e-5
+eps: 0.2               # load-bearing once staleness > 0
+kl_coef: 0.0
+length_norm: true
+norm_std: true
+max_new_tokens: 512
+temperature: 0.8
+top_p: 1.0
+think: false
+
+seed: 0
+eval_every: 20         # eval runs on the trainer GPU and competes with training
+eval_n: 64
+ckpt_every: 0
+n_examples: 20000
+out: runs/qwen3_async_8xh100

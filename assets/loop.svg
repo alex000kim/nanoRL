@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 240" font-family="system-ui,-apple-system,'Segoe UI',sans-serif">
+<rect width="880" height="240" fill="#FFFFFF"/>
+<defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+  <path d="M0 0L10 5L0 10z" fill="#6B7280"/></marker></defs>
+
+<text x="30" y="34" fill="#1F2430" font-size="15" font-weight="600">One loop, four stages. Algorithms differ only inside the dashed box.</text>
+
+<rect x="30" y="60" width="180" height="76" rx="8" fill="#F3F4F6" stroke="#D1D5DB"/>
+<text x="120" y="88" fill="#1F2430" font-size="13" font-weight="600" text-anchor="middle">rollout</text>
+<text x="120" y="108" fill="#6B7280" font-size="11" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">generate + reward</text>
+<text x="120" y="124" fill="#6B7280" font-size="11" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">no grad</text>
+
+<rect x="250" y="60" width="180" height="76" rx="8" fill="#EAF0FD" stroke="#3D6DE0" stroke-dasharray="5 4" stroke-width="1.5"/>
+<text x="340" y="88" fill="#1F2430" font-size="13" font-weight="600" text-anchor="middle">advantage(batch)</text>
+<text x="340" y="108" fill="#3D6DE0" font-size="11" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">reinforce | ppo</text>
+<text x="340" y="124" fill="#3D6DE0" font-size="11" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">grpo | rloo</text>
+
+<rect x="470" y="60" width="180" height="76" rx="8" fill="#F3F4F6" stroke="#D1D5DB"/>
+<text x="560" y="88" fill="#1F2430" font-size="13" font-weight="600" text-anchor="middle">clipped update</text>
+<text x="560" y="108" fill="#6B7280" font-size="11" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">ratio = exp(logp-old)</text>
+<text x="560" y="124" fill="#6B7280" font-size="11" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">min(r*A, clip(r)*A)</text>
+
+<rect x="690" y="60" width="160" height="76" rx="8" fill="#F3F4F6" stroke="#D1D5DB"/>
+<text x="770" y="88" fill="#1F2430" font-size="13" font-weight="600" text-anchor="middle">publish</text>
+<text x="770" y="108" fill="#6B7280" font-size="11" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">weights v+1</text>
+<text x="770" y="124" fill="#6B7280" font-size="11" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">sync: no-op</text>
+
+<line x1="210" y1="98" x2="243" y2="98" stroke="#6B7280" stroke-width="1.5" marker-end="url(#a)"/>
+<line x1="430" y1="98" x2="463" y2="98" stroke="#6B7280" stroke-width="1.5" marker-end="url(#a)"/>
+<line x1="650" y1="98" x2="683" y2="98" stroke="#6B7280" stroke-width="1.5" marker-end="url(#a)"/>
+<path d="M770 136 L770 176 L120 176 L120 143" stroke="#6B7280" stroke-width="1.5" fill="none" marker-end="url(#a)"/>
+
+<text x="440" y="214" fill="#C9761F" font-size="12" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">the seam: sync keeps ratio == 1; async makes it correct staleness, same loss either way</text>
+</svg>

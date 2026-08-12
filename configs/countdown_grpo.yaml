@@ -1,0 +1,24 @@
+# GRPO on Countdown with Qwen2.5-0.5B. Any single 24-40GB GPU, a few hours.
+task: countdown
+algo: grpo
+model: Qwen/Qwen2.5-0.5B-Instruct
+steps: 500
+n_prompts: 32          # questions per step
+group_size: 8          # completions per question; must be >= 2
+inner_epochs: 1
+lr: 1.0e-6
+eps: 0.2
+kl_coef: 0.0           # no reference model
+length_norm: true      # false = Dr.GRPO aggregator
+norm_std: true         # false = Dr.GRPO advantage
+max_new_tokens: 512
+temperature: 0.8       # 1.0 makes a 0.5B model garble the answer tags
+top_p: 1.0             # <1 is not modeled in the ratio; use temperature instead
+micro_batch: 4         # sequences per fwd+bwd chunk; lower to 2 on 24GB
+dtype: bfloat16        # compute dtype; master weights stay fp32
+device: cuda
+eval_every: 20
+eval_n: 128
+ckpt_every: 100
+n_examples: 50000
+out: runs/countdown_grpo

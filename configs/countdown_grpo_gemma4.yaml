@@ -1,0 +1,36 @@
+# GRPO on Countdown with Gemma-4-12B-it, 8x H100/H200, one node.
+#   torchrun --nproc_per_node=8 train.py --config configs/countdown_grpo_gemma4.yaml
+task: countdown
+algo: grpo
+model: google/gemma-4-12B-it
+
+n_prompts: 48          # GLOBAL batch: 6 per rank x 8 completions = 384 sequences/step
+group_size: 8
+micro_batch: 4         # scoring is bound by [micro_batch, T, 262k-vocab] logits; 8 OOMs on 80GB
+gen_batch: 24          # generation is KV-bound; batch 4 was 6x slower per step
+
+lora: true             # full FT of 12B needs ~192GB/GPU
+lora_r: 32
+grad_ckpt: true
+dtype: bfloat16
+device: cuda
+
+steps: 50
+inner_epochs: 1
+lr: 5.0e-5
+eps: 0.2
+kl_coef: 0.0
+length_norm: true
+norm_std: true
+max_new_tokens: 512    # 200 truncated the reasoning before <answer>, scoring 0
+temperature: 0.8
+top_p: 1.0
+think: false           # thinking template multiplies rollout cost
+
+seed: 0
+eval_every: 10
+eval_n: 128
+ckpt_every: 0
+n_examples: 20000
+debug_samples: 2       # print real completions early to catch template/parsing bugs
+out: runs/gemma4_12b_countdown

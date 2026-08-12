@@ -1,0 +1,25 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install (CPU-only torch)
+        run: |
+          pip install -q uv
+          uv pip install --system --index-url https://download.pytorch.org/whl/cpu torch
+          uv pip install --system transformers gymnasium numpy pyyaml
+      - name: Run tests
+        # the LLM test downloads a ~2MB tiny model; require it rather than let it skip silently
+        env:
+          NANORL_REQUIRE_LLM_TEST: "1"
+        run: python tests/test_nanorl.py
