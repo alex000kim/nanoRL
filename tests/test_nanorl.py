@@ -356,7 +356,9 @@ def test_data_parallel_gradients_match_single_process():
         return
     here = os.path.dirname(os.path.abspath(__file__))
     script = os.path.join(here, "dist_equiv.py")
-    env = {**os.environ, "GLOO_SOCKET_IFNAME": os.environ.get("GLOO_SOCKET_IFNAME", "lo0"),
+    env = {**os.environ,
+           "GLOO_SOCKET_IFNAME": os.environ.get(
+               "GLOO_SOCKET_IFNAME", "lo0" if sys.platform == "darwin" else "lo"),
            "OMP_NUM_THREADS": "1"}
     subprocess.run([sys.executable, script], check=True, env=env,
                    capture_output=True, timeout=300)          # writes the reference
