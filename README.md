@@ -29,7 +29,8 @@ snapshots the trainer keeps.
 The trainer doesn't trust logprobs computed anywhere else. It recomputes `old_logp` under
 the exact weights that sampled each batch (a batch whose weights it no longer has is
 dropped, never trained on) and prints the measured gap every step, next to the importance
-ratio, the staleness, and the queue drops. The same  applies to sampling itself: HF's `generate()` silently inherits `top_k`,
+ratio, the staleness, and the queue drops. The same applies to sampling itself: HF's
+`generate()` silently inherits `top_k`,
 `repetition_penalty` and friends from a model's `generation_config.json` (Qwen ships
 `top_k=20`), warping the sampling distribution in ways the loss never sees — so HFPolicy
 neutralizes every knob the ratio doesn't model.
@@ -55,7 +56,7 @@ python train.py --task cartpole --algo reinforce     # solves in ~10 s on CPU
 | 2 | `--config configs/cartpole_ppo.yaml` | CPU, ~20 s |
 | 3 | `--config configs/countdown_grpo.yaml` | 1x 24 GB GPU |
 | 4 | `torchrun --nproc_per_node=8 train.py --config configs/countdown_grpo_gemma4.yaml` | 8x H100 |
-| 5 | `sky jobs launch sky/jobgroup.yaml` | 2+ GPUs, any cloud |
+| 5 | `sky jobs launch sky/jobgroup.yaml` | 2+ GPUs, any k8s cluster |
 
 ## The end-to-end run
 
@@ -81,8 +82,9 @@ instead of collapsing.
 
 ![Async health](assets/async_health.png)
 
-To reproduce: `sky jobs launch sky/jobgroup.yaml` against any cloud or k8s cluster. Two
-GPUs are enough (one trainer, one worker). If you add trainer ranks, add workers to match,
+To reproduce: `sky jobs launch sky/jobgroup.yaml` against any k8s cluster (Job Groups run
+elsewhere too, but the hostname-based discovery the workers use to find the trainer is
+Kubernetes-only). Two GPUs are enough (one trainer, one worker). If you add trainer ranks, add workers to match,
 because each rank consumes one worker submission per step. The run's CSV is in
 [results/](results/). The sync path (rung 4) got Gemma-4-12B from 0.312 to 0.688 on the
 same task.
