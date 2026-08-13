@@ -17,23 +17,21 @@ the repo exists to feed this one line correctly.
 
 ## What's in it
 
-The algorithm zoo is [algos.py](algos.py), ~90 lines: raw returns, a constant baseline, GAE
+The algorithm zoo is [algos.py](algos.py): raw returns, a constant baseline, GAE
 with a critic, and the group baselines (GRPO, RLOO). A new algorithm is one function.
 
 Async training is the same loop split across machines. Run `--role trainer` on one box and
-`--role rollout` on the others; they talk over stdlib HTTP ([serve.py](serve.py), ~250
-lines). A worker that dies costs you its in-flight batch and nothing else. There's one knob,
+`--role rollout` on the others; they talk over stdlib HTTP ([serve.py](serve.py)).
+A worker that dies costs you its in-flight batch and nothing else. There's one knob,
 `max_staleness`, and it sets the rejection bound, the queue depth, and how many weight
 snapshots the trainer keeps.
 
 The trainer doesn't trust logprobs computed anywhere else. It recomputes `old_logp` under
 the exact weights that sampled each batch (a batch whose weights it no longer has is
 dropped, never trained on) and prints the measured gap every step, next to the importance
-ratio, the staleness, and the queue drops. The same applies to sampling itself: HF's
-`generate()` silently inherits `top_k`,
-`repetition_penalty` and friends from a model's `generation_config.json` (Qwen ships
-`top_k=20`), warping the sampling distribution in ways the loss never sees — so HFPolicy
-neutralizes every knob the ratio doesn't model.
+ratio, the staleness, and the queue drops. The same applies to sampling: HFPolicy
+neutralizes every `generation_config.json` knob the ratio doesn't model (`top_k`,
+`repetition_penalty`, ...).
 
 For speed: vLLM on the workers, separate batch sizes for generation and scoring (they have
 opposite memory profiles; tying them cost 6x in one measured run), adapter-only weight sync
@@ -56,7 +54,7 @@ python train.py --task cartpole --algo reinforce     # solves in ~10 s on CPU
 | 2 | `--config configs/cartpole_ppo.yaml` | CPU, ~20 s |
 | 3 | `--config configs/countdown_grpo.yaml` | 1x 24 GB GPU |
 | 4 | `torchrun --nproc_per_node=8 train.py --config configs/countdown_grpo_gemma4.yaml` | 8x H100 |
-| 5 | `sky jobs launch sky/jobgroup.yaml` | 2+ GPUs, any k8s cluster |
+| 5 | `sky jobs launch sky/jobgroup.yaml` | 2+ GPUs, k8s only (workers find the trainer by hostname) |
 
 ## The end-to-end run
 
@@ -82,10 +80,7 @@ instead of collapsing.
 
 ![Async health](assets/async_health.png)
 
-To reproduce: `sky jobs launch sky/jobgroup.yaml` against any k8s cluster (Job Groups run
-elsewhere too, but the hostname-based discovery the workers use to find the trainer is
-Kubernetes-only). Two GPUs are enough (one trainer, one worker). If you add trainer ranks, add workers to match,
-because each rank consumes one worker submission per step. The run's CSV is in
+Two GPUs are enough to reproduce (one trainer, one worker). The run's CSV is in
 [results/](results/). The sync path (rung 4) got Gemma-4-12B from 0.312 to 0.688 on the
 same task.
 
