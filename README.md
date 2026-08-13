@@ -2,7 +2,8 @@
 
 One RL training loop that runs CartPole on a laptop and disaggregated async RLVR on a GPU
 cluster. About 1,800 lines across 7 files. No Ray, no TRL, no DeepSpeed. It's small enough
-to read in an afternoon, and it's meant to be forked, not imported.
+to read in an afternoon, and, in the spirit of
+[nanoGPT](https://github.com/karpathy/nanoGPT), it's meant to be forked, not imported.
 
 ```python
 loss = -(advantage * logprob).mean()      # + PPO ratio clip, + optional KL
