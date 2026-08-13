@@ -26,14 +26,17 @@ lines). A worker that dies costs you its in-flight batch and nothing else. There
 snapshots the trainer keeps.
 
 The trainer doesn't trust logprobs computed anywhere else. It recomputes `old_logp` under
-the exact weights that sampled each batch and prints the measured gap every step, next to
-the importance ratio, the staleness, and the queue drops. This sounds paranoid until you
-watch a run collapse because vLLM and HF disagree in the third decimal place (more below).
+the exact weights that sampled each batch (a batch whose weights it no longer has is
+dropped, never trained on) and prints the measured gap every step, next to the importance
+ratio, the staleness, and the queue drops. The same  applies to sampling itself: HF's `generate()` silently inherits `top_k`,
+`repetition_penalty` and friends from a model's `generation_config.json` (Qwen ships
+`top_k=20`), warping the sampling distribution in ways the loss never sees — so HFPolicy
+neutralizes every knob the ratio doesn't model.
 
 For speed: vLLM on the workers, separate batch sizes for generation and scoring (they have
 opposite memory profiles; tying them cost 6x in one measured run), adapter-only weight sync
 at ~170 MB instead of 16 GB, and a micro-batched backward that produces exactly the same
-gradient as one big backward on any number of GPUs. 38 CPU-only tests pin all of this down:
+gradient as one big backward on any number of GPUs. 44 CPU-only tests pin all of this down:
 `python tests/test_nanorl.py`.
 
 ## Quickstart
@@ -64,10 +67,10 @@ them together by hostname.
 
 | Metric | Value |
 |---|---|
-| Held-out accuracy (greedy) | 0.391 to 0.641 peak (+25 pp); plateaus near 0.61 after step 80 |
-| Throughput | 512 sequences/update; 200 steps, 102k sequences in 91 min |
-| Staleness | mean 1.9 versions, max 2; 0 of 1,601 batches dropped |
-| Worker vs trainer logprob gap | 0.027 to 0.008, corrected every step |
+| Held-out accuracy (greedy) | 0.391 to 0.609 peak (+22 pp) at step 60; 0.61 again at steps 160–180 |
+| Throughput | 512 sequences/update; 200 steps, 102k sequences in 90 min |
+| Staleness | mean 1.8 versions, max 2; 0 of 1,603 batches dropped (staleness bound or missing snapshot) |
+| Worker vs trainer logprob gap | 0.026 to 0.007, corrected every step |
 
 The gap row is the one that earns its keep. vLLM computes logprobs with different kernels
 than the trainer's HF forward. An earlier run used them as `old_logp` anyway: the ratio

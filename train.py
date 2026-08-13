@@ -138,6 +138,16 @@ def recompute_old_logp(policy, batch, snap: dict, cfg):
     return old
 
 
+def split_fingerprint(cfg: Config) -> str:
+    """The fields that determine the train/eval split and task identity. Trainer and workers
+    derive the split independently; if these differ, workers TRAIN on the trainer's held-out
+    problems and the eval metric silently inflates. The trainer serves this string and every
+    worker asserts against it before generating."""
+    import json
+    keys = ("task", "model", "seed", "n_examples", "eval_n", "think")
+    return json.dumps({k: getattr(cfg, k) for k in keys}, sort_keys=True)
+
+
 def kl_penalty(logp, ref_logp):
     """k3 KL estimator (GRPO): exp(Δ) - Δ - 1 >= 0, per token. Δ = ref_logp - logp."""
     d = ref_logp - logp
@@ -246,6 +256,11 @@ def validate(cfg: Config) -> None:
         raise ValueError(f"--algo {cfg.algo} needs --group-size >= 2 (got {cfg.group_size}).")
     if cfg.task != "cartpole" and not cfg.model:
         raise ValueError(f"--task {cfg.task} is an LLM task; pass --model <hf-id>.")
+    if cfg.role and not os.environ.get("NANORL_TOKEN"):
+        raise ValueError(
+            "async roles require NANORL_TOKEN (same value on trainer and workers): the "
+            "trainer's HTTP endpoint serves weights and ingests training batches on 0.0.0.0 "
+            "and must not run unauthenticated.")
 
 
 # --------------------------------------------------------------------------- #
@@ -284,10 +299,27 @@ class AsyncSource:
         # and the fleet delivers in bursts), and snapshots outlive every acceptable version.
         self.keep = cfg.max_staleness + 2
         self.server = (TrainerServer(port=cfg.serve_port,
-                                     queue_max=(cfg.max_staleness + 1) * world)
+                                     queue_max=(cfg.max_staleness + 1) * world,
+                                     meta=split_fingerprint(cfg))
                        if rank == 0 else None)
         self.local_snaps: dict = {}       # version -> adapter state, mirrored on every rank
         self.version = 0
+        self.snap_dropped = 0             # batches rejected for lacking a sampling snapshot
+
+    def _pop_fresh(self, timeout: float):
+        """Pop until a batch whose sampling version has a live snapshot. A batch without one
+        could only be trained by trusting worker logprobs — the exact failure
+        recompute_old_logp exists to prevent — so it is dropped, never trained on."""
+        import time
+        deadline = time.time() + timeout
+        while True:
+            batch, lag = self.server.pop(self.cfg.max_staleness,
+                                         timeout=max(0.0, deadline - time.time()))
+            if (self.version - lag) in self.local_snaps:
+                return batch, lag
+            self.snap_dropped += 1
+            print(f"[warn] dropped batch sampled at v{self.version - lag}: no snapshot to "
+                  f"recompute old_logp under (would have to trust worker logprobs)", flush=True)
 
     def next_batch(self, policy):
         if self.world > 1:
@@ -295,8 +327,7 @@ class AsyncSource:
             payload = [None] * self.world
             if self.rank == 0:            # rank 0 owns the queue; one batch per rank per step
                 try:
-                    payload = [tuple(self.server.pop(self.cfg.max_staleness,
-                                                     timeout=self.cfg.pop_timeout))
+                    payload = [tuple(self._pop_fresh(self.cfg.pop_timeout))
                                for _ in range(self.world)]
                 except TimeoutError:
                     pass                  # broadcast the Nones so every rank fails together
@@ -306,28 +337,28 @@ class AsyncSource:
                 raise TimeoutError(f"rank 0 got no fresh rollouts within {self.cfg.pop_timeout}s")
             batch, lag = payload[self.rank]
         else:
-            batch, lag = self.server.pop(self.cfg.max_staleness, timeout=self.cfg.pop_timeout)
+            batch, lag = self._pop_fresh(self.cfg.pop_timeout)
 
         # ALWAYS recompute old_logp under the sampling version's weights; worker logprobs
-        # are kept only to measure the kernel/architecture gap (logp_gap in the log)
+        # are kept only to measure the kernel/architecture gap (logp_gap in the log).
+        # _pop_fresh guarantees the snapshot exists (snapshot dicts are identical on every
+        # rank: all ranks apply the same all-reduced updates and publish in lockstep).
         snap = self.local_snaps.get(self.version - lag)
         if snap is None:
-            # only version 0 can lack a snapshot; NaN so "skipped" never reads as "perfect"
-            self.mismatch = float("nan")
-            print("[warn] no snapshot for sampled version; old_logp NOT recomputed for "
-                  "this batch", flush=True)
-        else:
-            batch = batch.to(self.cfg.device)
-            exact = recompute_old_logp(policy, batch, snap, self.cfg).to(batch.old_logp.device)
-            m = batch.mask.bool().cpu()
-            self.mismatch = (float((exact.cpu()[m] - batch.old_logp.cpu()[m]).abs().mean())
-                             if m.any() else 0.0)
-            batch.old_logp = exact.to(batch.mask.device)
+            raise RuntimeError(f"no snapshot for sampled version {self.version - lag} after "
+                               f"_pop_fresh accepted it — rank snapshot dicts have diverged")
+        batch = batch.to(self.cfg.device)
+        exact = recompute_old_logp(policy, batch, snap, self.cfg).to(batch.old_logp.device)
+        m = batch.mask.bool().cpu()
+        self.mismatch = (float((exact.cpu()[m] - batch.old_logp.cpu()[m]).abs().mean())
+                         if m.any() else 0.0)
+        batch.old_logp = exact.to(batch.mask.device)
         return batch, lag
 
     def stats(self):
         base = self.server.stats() if self.server is not None else {}
-        return {**base, "logp_gap": round(getattr(self, "mismatch", 0.0), 4)}
+        return {**base, "snap_dropped": self.snap_dropped,
+                "logp_gap": round(getattr(self, "mismatch", 0.0), 4)}
 
     def publish(self, policy):
         # every rank snapshots locally; only rank 0 serves the outside world
@@ -370,6 +401,12 @@ def rollout_worker(cfg: Config):
     client = RolloutClient(cfg.trainer_url)
     print(device_banner(f"rollout w{wid}/{wtot}", cfg), flush=True)
     client.wait_for_trainer()
+    # A worker with a different seed/n_examples/eval_n derives a DIFFERENT split and trains
+    # on the trainer's held-out problems — silently inflating eval. Fail loudly instead.
+    mine, theirs = split_fingerprint(cfg), client.fetch_config()
+    if theirs and theirs != mine:
+        raise RuntimeError(f"worker/trainer config mismatch — the data split would differ.\n"
+                           f"  trainer: {theirs}\n  worker : {mine}")
     roll_kw = {} if cfg.task == "cartpole" else dict(
         max_new_tokens=cfg.max_new_tokens, temperature=cfg.temperature, top_p=cfg.top_p)
 

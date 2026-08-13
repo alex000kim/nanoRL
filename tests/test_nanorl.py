@@ -620,6 +620,113 @@ def test_llm_stop_tokens_cover_generation_config():
     assert pol.stop_ids == {int(x) for x in expect if x is not None}
 
 
+def test_hf_sampling_knobs_are_neutralized():
+    """generate() inherits any knob not passed explicitly from generation_config.json
+    (Qwen ships top_k=20 + repetition_penalty=1.1; HF's own default is top_k=50). The loss
+    models softmax(logits/T) only, so HFPolicy must neutralize every other warper — the bias
+    is invisible to the ratio (==1 on epoch one by construction) and to logp_gap."""
+    try:
+        from model import HFPolicy
+        pol = HFPolicy("hf-internal-testing/tiny-random-gpt2", device="cpu", dtype="float32")
+    except Exception:
+        if os.environ.get("NANORL_REQUIRE_LLM_TEST"):
+            raise
+        _SKIPPED.append("test_hf_sampling_knobs_are_neutralized")
+        return
+    gc = pol.model.generation_config
+    assert gc.top_k in (0, None), gc.top_k
+    assert gc.top_p == 1.0 and gc.temperature == 1.0
+    assert gc.repetition_penalty == 1.0 and gc.no_repeat_ngram_size == 0
+    assert getattr(gc, "min_p", None) in (None, 0.0)
+
+
+def test_grad_ckpt_enables_training_mode_without_dropout():
+    """HF layers only checkpoint when model.training is True (from_pretrained returns eval
+    mode), so grad_ckpt must flip train mode — with every Dropout pinned to 0 first, or
+    old_logp and the update would see different networks."""
+    try:
+        from model import HFPolicy
+        pol = HFPolicy("hf-internal-testing/tiny-random-gpt2", device="cpu", dtype="float32",
+                       grad_ckpt=True)
+    except Exception:
+        if os.environ.get("NANORL_REQUIRE_LLM_TEST"):
+            raise
+        _SKIPPED.append("test_grad_ckpt_enables_training_mode_without_dropout")
+        return
+    import torch.nn as nn
+    assert pol.model.training, "grad_ckpt without train() is a silent no-op"
+    drops = [m for m in pol.model.modules() if isinstance(m, nn.Dropout)]
+    assert drops and all(m.p == 0.0 for m in drops), "dropout would break ratio==1"
+    pol2 = HFPolicy("hf-internal-testing/tiny-random-gpt2", device="cpu", dtype="float32")
+    assert not pol2.model.training, "without grad_ckpt the model must stay in eval mode"
+    # generation must run in eval mode either way: train-mode generate disables the KV cache
+    # and takes a different forward path that corrupts greedy decoding (measured: a 0.5B
+    # model's countdown answer degrades to garbage, eval_acc 0.39 -> 0.00 on the cluster)
+    prompts = ["hello world", "the quick brown fox"]
+    assert pol.generate(prompts, max_new_tokens=16, temperature=0.0) == \
+           pol2.generate(prompts, max_new_tokens=16, temperature=0.0)
+    assert pol.model.training, "train mode must be restored after generation"
+
+
+def test_async_drops_batch_without_snapshot():
+    """A batch whose sampling version has no snapshot must be DROPPED, not trained on with
+    worker logprobs as old_logp (the documented run-collapsing failure)."""
+    from serve import RolloutClient
+    from train import AsyncSource, Config
+    torch.manual_seed(0)
+    cfg = Config(role="trainer", device="cpu", max_staleness=4, pop_timeout=30, serve_port=8734)
+    src = AsyncSource(cfg)
+    try:
+        pol = MLPPolicy(2, 3)
+        src.publish(pol)                             # -> version 1; snapshot exists for v1 only
+        cli = RolloutClient("http://127.0.0.1:8734")
+        cli.wait_for_trainer(timeout=30)
+        cli.submit(0, _toy_batch())                  # v0: within staleness, but NO snapshot
+        cli.submit(1, _toy_batch())                  # v1: has a snapshot
+        batch, lag = src.next_batch(pol)
+        assert lag == 0                              # the v1 batch; v0 was dropped
+        assert src.stats()["snap_dropped"] == 1
+    finally:
+        src.server.close()
+
+
+def test_worker_and_trainer_split_fingerprints():
+    """The trainer serves its split fingerprint; a worker whose fingerprint differs would
+    train on the trainer's eval holdout, so the fields that shape the split must all be in."""
+    from serve import RolloutClient, TrainerServer
+    from train import Config, split_fingerprint
+    fp = split_fingerprint(Config(task="countdown", model="m", seed=0))
+    srv = TrainerServer(port=8735, queue_max=2, meta=fp)
+    try:
+        cli = RolloutClient("http://127.0.0.1:8735")
+        cli.wait_for_trainer(timeout=30)
+        assert cli.fetch_config() == fp              # survives the wire verbatim
+        for k, v in (("seed", 1), ("n_examples", 999), ("eval_n", 7), ("task", "gsm8k")):
+            assert split_fingerprint(Config(task="countdown", model="m", **{k: v}) if k != "task"
+                                     else Config(task=v, model="m")) != fp, k
+    finally:
+        srv.close()
+
+
+def test_validate_requires_token_for_async_roles():
+    """The trainer's HTTP endpoint serves weights and ingests training data on 0.0.0.0;
+    running either async role without NANORL_TOKEN must fail loudly at startup."""
+    from train import Config, validate
+    old = os.environ.pop("NANORL_TOKEN", None)
+    try:
+        try:
+            validate(Config(role="trainer"))
+            raise AssertionError("unauthenticated trainer should be rejected")
+        except ValueError as e:
+            assert "NANORL_TOKEN" in str(e)
+        os.environ["NANORL_TOKEN"] = "t"
+        validate(Config(role="trainer"))             # same config passes once the token is set
+    finally:
+        os.environ.pop("NANORL_TOKEN", None)
+        if old is not None:
+            os.environ["NANORL_TOKEN"] = old
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

@@ -81,9 +81,10 @@ class TrainerServer:
     """Current weights + a bounded queue of incoming batches. The queue bound and the
     version check in pop() are the entire staleness policy."""
 
-    def __init__(self, port: int = 8000, queue_max: int = 8):
+    def __init__(self, port: int = 8000, queue_max: int = 8, meta: str = ""):
         self.version = 0
         self.blob = _dump({})                 # serialized weights for the current version
+        self.meta = meta                      # split fingerprint; workers assert against it
         self.q: deque = deque(maxlen=queue_max)
         self.lock = threading.Lock()
         self.dropped = 0                      # batches evicted by the bound (a real metric)
@@ -154,6 +155,8 @@ def _make_handler(store: "TrainerServer"):
                 return self._send(403)
             if self.path.startswith("/version"):
                 self._send(200, str(store.version).encode())
+            elif self.path.startswith("/config"):
+                self._send(200, store.meta.encode(), ctype="application/json")
             elif self.path.startswith("/adapter"):
                 with store.lock:
                     ver, tar = store.version, store.tar
@@ -212,6 +215,11 @@ class RolloutClient:
             except (urllib.error.URLError, OSError):
                 time.sleep(2.0)
         raise TimeoutError(f"trainer at {self.url} never came up")
+
+    def fetch_config(self, timeout: float = 30.0) -> str:
+        """The trainer's split fingerprint (empty on trainers that predate the check)."""
+        with self._get("/config", timeout=timeout) as r:
+            return r.read().decode()
 
     def pull_weights(self, have: int):
         """Return (version, state_dict) if the trainer is ahead of `have`, else (have, None)."""

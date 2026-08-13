@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import contextlib
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -192,6 +194,14 @@ class HFPolicy(nn.Module):
             self.model.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": False})
             self.model.config.use_cache = False       # incompatible with checkpointing
+            # HF layers only checkpoint when self.training is True, and from_pretrained
+            # returns the model in eval mode — without train() the flag is a silent no-op.
+            # Dropout must be pinned to 0 first, or train mode would make old_logp and the
+            # update see different networks (breaking the ratio==1 invariant).
+            for m in self.model.modules():
+                if isinstance(m, nn.Dropout):
+                    m.p = 0.0
+            self.model.train()
         self.model.to(device)
         self.pad_id = self.tok.pad_token_id
         self.is_lora = lora
@@ -203,6 +213,17 @@ class HFPolicy(nn.Module):
         gen_eos = getattr(getattr(self.model, "generation_config", None), "eos_token_id", None)
         stops = gen_eos if isinstance(gen_eos, (list, tuple)) else [gen_eos]
         self.stop_ids = {int(s) for s in [*stops, self.tok.eos_token_id] if s is not None}
+        # generate() fills every knob NOT passed explicitly from the model's
+        # generation_config.json (Qwen ships top_k=20 + repetition_penalty=1.1; HF's own
+        # default is top_k=50). The loss models softmax(logits/T) and nothing else, so any
+        # extra warper samples from a distribution the gradient never sees — and no
+        # diagnostic catches it: the ratio is 1 on the first epoch by construction.
+        gc = self.model.generation_config
+        for k, v in dict(temperature=1.0, top_p=1.0, top_k=0, min_p=None, typical_p=1.0,
+                         epsilon_cutoff=0.0, eta_cutoff=0.0, repetition_penalty=1.0,
+                         no_repeat_ngram_size=0, penalty_alpha=None, num_beams=1).items():
+            if hasattr(gc, k):
+                setattr(gc, k, v)
         self.v = None  # no critic for RLVR
 
     def _autocast(self):
@@ -211,6 +232,20 @@ class HFPolicy(nn.Module):
             return contextlib.nullcontext()
         dev = "cuda" if str(self.device).startswith("cuda") else "cpu"
         return torch.autocast(device_type=dev, dtype=self.amp_dtype)
+
+    @contextlib.contextmanager
+    def _eval_mode(self):
+        """Generation always runs in eval mode. Under grad_ckpt the model lives in train()
+        (HF layers only checkpoint when training), but train mode force-disables the KV cache
+        and switches generate() onto a different forward path — measured to corrupt greedy
+        decoding outright, not just slow it. The gradient forward keeps train mode."""
+        was = self.model.training
+        self.model.eval()
+        try:
+            yield
+        finally:
+            if was:
+                self.model.train()
 
     # ---- prompt formatting ------------------------------------------------ #
     def format_prompt(self, user_msg: str, system_msg: str | None = None) -> str:
@@ -237,6 +272,13 @@ class HFPolicy(nn.Module):
 
         expanded = [p for p in prompt_texts for _ in range(group_size)]
         trajs = []
+        with self._eval_mode():
+            return self._act_batches(expanded, max_new_tokens, temperature, temp, top_p, trajs)
+
+    def _act_batches(self, expanded, max_new_tokens, temperature, temp, top_p, trajs):
+        """act()'s body, split out so the whole thing (generation AND the old_logp scoring
+        forward) runs under _eval_mode."""
+        from core import Trajectory
         for i in range(0, len(expanded), self.gen_batch):
             chunk = expanded[i : i + self.gen_batch]
             self.tok.padding_side = "left"
@@ -282,6 +324,10 @@ class HFPolicy(nn.Module):
                  temperature: float = 0.0, top_p: float = 1.0) -> list[str]:
         """Decode-only (for eval): skips act()'s old_logp forward."""
         outs = []
+        with self._eval_mode():
+            return self._generate_batches(prompt_texts, max_new_tokens, temperature, top_p, outs)
+
+    def _generate_batches(self, prompt_texts, max_new_tokens, temperature, top_p, outs):
         for i in range(0, len(prompt_texts), self.gen_batch):
             chunk = prompt_texts[i : i + self.gen_batch]
             self.tok.padding_side = "left"
