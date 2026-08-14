@@ -1,43 +1,39 @@
 # nanoRL
 
-One RL training loop that runs CartPole on a laptop and disaggregated async RLVR on a GPU
-cluster. About 1,800 lines across 7 files. No Ray, no TRL, no DeepSpeed. It's small enough
-to read in an afternoon, and, in the spirit of
-[nanoGPT](https://github.com/karpathy/nanoGPT), it's meant to be forked, not imported.
+An RL training loop that runs CartPole on a laptop and disaggregated async RLVR on a GPU
+cluster. About 1,800 lines across 7 files, with no Ray, TRL, or DeepSpeed. Like
+[nanoGPT](https://github.com/karpathy/nanoGPT), it's a codebase to fork rather than a
+library to import.
 
 ```python
 loss = -(advantage * logprob).mean()      # + PPO ratio clip, + optional KL
 ```
 
-That's the whole update. REINFORCE, PPO, GRPO and RLOO only differ in how `advantage(...)`
-is computed, and sync vs async only differs in where batches come from. Everything else in
-the repo exists to feed this one line correctly.
+REINFORCE, PPO, GRPO and RLOO differ only in how `advantage(...)` is computed, and sync vs
+async only in where batches come from.
 
 ![The training loop](assets/loop.svg)
 
 ## What's in it
 
-The algorithm zoo is [algos.py](algos.py): raw returns, a constant baseline, GAE
-with a critic, and the group baselines (GRPO, RLOO). A new algorithm is one function.
+[algos.py](algos.py) has the advantage estimators: raw returns, a constant baseline, GAE
+with a critic, and the group baselines (GRPO, RLOO). Adding one means writing one function.
 
-Async training is the same loop split across machines. Run `--role trainer` on one box and
-`--role rollout` on the others; they talk over stdlib HTTP ([serve.py](serve.py)).
-A worker that dies costs you its in-flight batch and nothing else. There's one knob,
-`max_staleness`, and it sets the rejection bound, the queue depth, and how many weight
-snapshots the trainer keeps.
+Async training splits the same loop across machines. Run `--role trainer` on one box and
+`--role rollout` on the others; they talk over stdlib HTTP ([serve.py](serve.py)). If a
+worker dies you lose its in-flight batch. `max_staleness` is the only knob, and it sets
+three things at once: the rejection bound, the queue depth, and how many weight snapshots
+the trainer keeps.
 
-The trainer doesn't trust logprobs computed anywhere else. It recomputes `old_logp` under
-the exact weights that sampled each batch (a batch whose weights it no longer has is
-dropped, never trained on) and prints the measured gap every step, next to the importance
-ratio, the staleness, and the queue drops. The same applies to sampling: HFPolicy
-neutralizes every `generation_config.json` knob the ratio doesn't model (`top_k`,
-`repetition_penalty`, ...).
+The trainer recomputes `old_logp` under the exact weights that sampled each batch, drops
+any batch whose weights it no longer has, and prints the measured gap every step next to
+the importance ratio, the staleness, and the queue drops. HFPolicy also neutralizes the
+`generation_config.json` knobs the ratio doesn't model (`top_k`, `repetition_penalty`).
 
-For speed: vLLM on the workers, separate batch sizes for generation and scoring (they have
-opposite memory profiles; tying them cost 6x in one measured run), adapter-only weight sync
-at ~170 MB instead of 16 GB, and a micro-batched backward that produces exactly the same
-gradient as one big backward on any number of GPUs. 44 CPU-only tests pin all of this down:
-`python tests/test_nanorl.py`.
+Speed comes from vLLM on the workers, separate batch sizes for generation and scoring
+(opposite memory profiles; tying them cost 6x in one measured run), adapter-only weight
+sync at ~170 MB rather than 16 GB, and a micro-batched backward whose gradient matches one
+big backward on any number of GPUs. 44 CPU-only tests cover it: `python tests/test_nanorl.py`.
 
 ## Quickstart
 
@@ -48,7 +44,7 @@ uv pip install torch gymnasium numpy transformers "datasets<4" peft pyyaml
 python train.py --task cartpole --algo reinforce     # solves in ~10 s on CPU
 ```
 
-| Rung | Command | Hardware |
+| # | Command | Hardware |
 |---|---|---|
 | 1 | `--task cartpole --algo reinforce` | CPU, seconds |
 | 2 | `--config configs/cartpole_ppo.yaml` | CPU, ~20 s |
@@ -58,7 +54,7 @@ python train.py --task cartpole --algo reinforce     # solves in ~10 s on CPU
 
 ## The end-to-end run
 
-Rung 5, exactly as the YAML ships: Qwen3-8B with LoRA doing GRPO on Countdown. One 8x H100
+Row 5, exactly as the YAML ships: Qwen3-8B with LoRA doing GRPO on Countdown. One 8x H100
 node trains, eight L40S GPUs generate with vLLM, and a
 [SkyPilot Job Group](https://docs.skypilot.ai/en/latest/examples/job-groups.html) wires
 them together by hostname.
@@ -72,17 +68,15 @@ them together by hostname.
 | Staleness | mean 1.8 versions, max 2; 0 of 1,603 batches dropped (staleness bound or missing snapshot) |
 | Worker vs trainer logprob gap | 0.026 to 0.007, corrected every step |
 
-The gap row is the one that earns its keep. vLLM computes logprobs with different kernels
-than the trainer's HF forward. An earlier run used them as `old_logp` anyway: the ratio
-drifted from 1.006 to 1.165 at zero staleness and accuracy fell from 0.500 to 0.188. Now
-the trainer recomputes `old_logp` itself, and the same model on the same engines climbs
-instead of collapsing.
+That last row is why the trainer recomputes logprobs: vLLM computes them with different
+kernels than the trainer's HF forward. An earlier run used them as `old_logp` anyway, and
+the ratio drifted from 1.006 to 1.165 at zero staleness while accuracy fell from 0.500 to
+0.188.
 
 ![Async health](assets/async_health.png)
 
-Two GPUs are enough to reproduce (one trainer, one worker). The run's CSV is in
-[results/](results/). The sync path (rung 4) got Gemma-4-12B from 0.312 to 0.688 on the
-same task.
+Two GPUs are enough to reproduce (one trainer, one worker), and the run's CSV is in
+[results/](results/). On the sync path, row 4 got Gemma-4-12B from 0.312 to 0.688.
 
 ## Layout
 
@@ -98,13 +92,12 @@ train.py   ~560   the loop: rollout, advantage, clipped update, publish
 
 ## Your model, your dataset
 
-Any `AutoModelForCausalLM` id works with `--model`, as long as it fits on one GPU (with
-LoRA that's roughly 12B on 48 GB). LoRA targets `q_proj/k_proj/v_proj/o_proj`; if your
-model names its projections differently, that's a one-line change in
-[model.py](model.py). vLLM workers need an architecture vLLM can load.
+Any `AutoModelForCausalLM` id works with `--model` if it fits on one GPU, which with LoRA
+is roughly 12B on 48 GB. LoRA targets `q_proj/k_proj/v_proj/o_proj`; models that name their
+projections differently need a one-line change in [model.py](model.py).
 
-A dataset is a subclass of `LLMTask`: load rows, write `build_prompt`, pick reward
-functions, register the class in `make_task` ([tasks.py](tasks.py)), run with
+A dataset is a subclass of `LLMTask`. Load rows, write `build_prompt`, pick reward
+functions, register the class in `make_task` ([tasks.py](tasks.py)), then run with
 `--task <name>`:
 
 ```python
@@ -119,11 +112,10 @@ class MyTask(LLMTask):
         return p["question"] + "\nPut ONLY the final number in <answer> </answer> tags."
 ```
 
-A reward function is `(prompt, completion, answer) -> float` and can call whatever it
-wants, from a regex to an external judge.
+A reward function is `(prompt, completion, answer) -> float` and can call anything, from a
+regex to an external judge.
 
-Things deliberately left out: Megatron-scale parallelism, MoE, multi-tenant scheduling,
-dashboards. If you need those, you've outgrown this repo, and that's the point.
+Not included: Megatron-scale parallelism, MoE, multi-tenant scheduling, dashboards.
 
 ## License
 
