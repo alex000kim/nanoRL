@@ -61,6 +61,8 @@ class Config:
     device: str = "cpu"
     lora: bool = False
     lora_r: int = 16
+    # comma-separated for argparse; adding MLP projections grows the adapter several-fold
+    lora_targets: str = "q_proj,k_proj,v_proj,o_proj"
     grad_ckpt: bool = False         # recompute activations: ~30% slower, much less memory
     think: bool = False             # hybrid-reasoning chat template (Qwen3): long CoT, slow
     debug_samples: int = 0          # print N real completions at the start (new-model triage)
@@ -94,7 +96,8 @@ def make_policy(cfg: Config, task):
         from model import HFPolicy
         return HFPolicy(cfg.model, device=cfg.device, dtype=cfg.dtype, lora=cfg.lora,
                         lora_r=cfg.lora_r, micro_batch=cfg.micro_batch,
-                        gen_batch=cfg.gen_batch, grad_ckpt=cfg.grad_ckpt, think=cfg.think)
+                        gen_batch=cfg.gen_batch, grad_ckpt=cfg.grad_ckpt, think=cfg.think,
+                        lora_targets=cfg.lora_targets)
     from model import MLPPolicy
     return MLPPolicy(task.obs_dim, task.n_actions, value_head=(cfg.algo == "ppo")).to(cfg.device)
 

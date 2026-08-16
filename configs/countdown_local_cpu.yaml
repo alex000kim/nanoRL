@@ -1,0 +1,45 @@
+# Disaggregated async GRPO on a laptop: no GPU, no cloud. Sized so a trainer pod and a
+# rollout pod fit one `sky local up` kind node (10 CPU / 16 GB).
+#   sky local up && sky jobs launch sky/local_jobgroup.yaml
+# Ceiling is the model: five configs (lr, group_size, +MLP LoRA, 21-61 steps, staleness)
+# all stopped at 0.172-0.195. Past ~0.20 needs a bigger model.
+task: countdown
+algo: grpo
+
+# Not Qwen3.5-0.8B: it is a VL hybrid, and LoRA reaches 6 of its 24 layers vs 28/28 here.
+model: Qwen/Qwen3-0.6B
+
+n_prompts: 2           # per worker submission; 2 x 8 = 16 sequences is the whole batch
+group_size: 8          # < 8 leaves too many groups with zero reward variance, hence no grad
+micro_batch: 2         # scoring fwd+bwd chunk; CPU RAM is the bound
+gen_batch: 8           # trainer-side eval generation only
+
+max_staleness: 2       # 4 recovers ~half the dropped batches but did not move accuracy
+pop_timeout: 1800.0    # a CPU generation cycle is minutes
+serve_port: 8000
+
+lora: true             # adapters only: 4.59M params, 18.4 MB fp32
+lora_r: 16
+grad_ckpt: false       # CPU has RAM to spare; checkpointing only adds recompute
+dtype: float32         # laptop CPUs have no native bf16: fp32 52.5 tok/s vs bf16 30.6
+device: cpu
+
+steps: 21              # ~76 min; 61 steps was measured and bought nothing
+inner_epochs: 1
+lr: 1.0e-5             # not the GPU configs' 5e-5: that hits the ceiling inside step 0
+eps: 0.2
+kl_coef: 0.0
+length_norm: true
+norm_std: true
+max_new_tokens: 128    # the CPU wall-clock knob; completions run ~32 tokens anyway
+temperature: 0.8
+top_p: 1.0
+think: false
+
+seed: 0
+eval_every: 5          # evals only when step % eval_every == 0, so keep steps = 1 + k*this
+eval_n: 128            # 64 was too small: chance alone swung Fisher p from 0.002 to 0.62
+ckpt_every: 0
+n_examples: 20000
+debug_samples: 2       # "model is bad" and "we parse the wrong thing" look identical
+out: runs/countdown_local_cpu

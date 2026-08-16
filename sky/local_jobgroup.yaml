@@ -1,0 +1,52 @@
+# sky/jobgroup.yaml's trainer + rollout worker, hostname discovery and all, on the local
+# kind cluster `sky local up` creates. No GPU: kind has none, so workers use the plain HF
+# path, not --vllm. Needs Docker Desktop >= 12 GB (both pods hold a copy of the model).
+#
+#   sky local up && sky jobs launch sky/local_jobgroup.yaml
+#   sky jobs logs <id> trainer      # or: rollout
+#   sky local down
+---
+name: nanorl-local
+execution: parallel
+
+---
+name: trainer
+resources:
+  infra: k8s/kind-skypilot   # pinned: bare `k8s` would pick whatever kubeconfig points at
+  cpus: 4+                   # 4+4, not 5+4: kube-system already reserves ~1.05 of 10
+  memory: 6+
+envs:
+  CFG: configs/countdown_local_cpu.yaml
+  NANORL_TOKEN: nanorl-local
+workdir: .
+setup: |
+  command -v uv >/dev/null || pip install -q uv
+  # CPU wheel index: plain PyPI torch pulls ~4.5 GB of CUDA. No --system: these pods run
+  # inside a venv and the `sky` user cannot write to dist-packages.
+  uv pip install -q --index-url https://download.pytorch.org/whl/cpu torch
+  uv pip install -q transformers "datasets<4" peft numpy pyyaml
+run: |
+  export HF_HOME=$HOME/.cache/huggingface
+  export OMP_NUM_THREADS=4   # SkyPilot sets 1, which makes every forward ~5x slower
+  python train.py --config $CFG --role trainer --serve-port 8000   # no torchrun: 1 process
+
+---
+name: rollout
+num_nodes: 1
+resources:
+  infra: k8s/kind-skypilot
+  cpus: 4+
+  memory: 5+
+envs:
+  CFG: configs/countdown_local_cpu.yaml
+  NANORL_TOKEN: nanorl-local
+workdir: .
+setup: |
+  command -v uv >/dev/null || pip install -q uv
+  uv pip install -q --index-url https://download.pytorch.org/whl/cpu torch
+  uv pip install -q transformers "datasets<4" peft numpy pyyaml
+run: |
+  export HF_HOME=$HOME/.cache/huggingface
+  export OMP_NUM_THREADS=4
+  python train.py --config $CFG --role rollout \
+    --trainer-url http://trainer-0.nanorl-local:8000

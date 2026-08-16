@@ -163,7 +163,8 @@ class HFPolicy(nn.Module):
 
     def __init__(self, model_name: str, device: str = "cpu", dtype: str = "bfloat16",
                  lora: bool = False, lora_r: int = 16, micro_batch: int = 4,
-                 gen_batch: int = 0, grad_ckpt: bool = False, think: bool = False):
+                 gen_batch: int = 0, grad_ckpt: bool = False, think: bool = False,
+                 lora_targets: str = "q_proj,k_proj,v_proj,o_proj"):
         super().__init__()
         self.think = think        # hybrid-reasoning template toggle (see format_prompt)
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -184,7 +185,7 @@ class HFPolicy(nn.Module):
         if lora:
             from peft import LoraConfig, get_peft_model
             cfg = LoraConfig(r=lora_r, lora_alpha=lora_r * 2, lora_dropout=0.0,
-                             target_modules=["q_proj", "k_proj", "v_proj", "o_proj"])
+                             target_modules=[t for t in lora_targets.split(",") if t.strip()])
             self.model = get_peft_model(self.model, cfg)
             for p in self.model.parameters():   # adapters must be fp32 (see above)
                 if p.requires_grad:
