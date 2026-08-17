@@ -1,6 +1,6 @@
 # nanoRL
 
-One RL training loop that scales from a laptop CPU to a GPU cluster. **No GPU required** —
+One RL training loop that scales from a laptop CPU to a GPU cluster. **No GPU required**:
 the same disaggregated trainer/worker setup that runs on 16 GPUs runs as two pods on your
 laptop. ~1,800 lines across 7 files, no Ray, TRL or DeepSpeed. Like
 [nanoGPT](https://github.com/karpathy/nanoGPT), a codebase to fork, not a library to import.
@@ -36,12 +36,12 @@ sky local down
 
 ![Local CPU run](assets/local_run.png)
 
-Held-out accuracy **0.039 to 0.164**, peak 0.195 — 5 of 128 problems solved to 25, Fisher
-p = 0.0015. The ceiling is the model, not the config: five configurations all stopped at
+Held-out accuracy **0.039 to 0.164**, peak 0.195 (5 of 128 problems solved rising to 25,
+Fisher p = 0.0015). The ceiling is the model, not the config: five configurations all stopped at
 0.172-0.195, and completions run ~32 tokens against a 128-token budget, so nothing is
 truncated. One CPU worker outruns one trainer, so batches age past `max_staleness` and are
-rejected (20 of 42). `logp_gap` is necessarily 0.000 — vLLM is CUDA-only, so both roles
-share one HF forward.
+rejected (20 of 42). `logp_gap` is necessarily 0.000, because vLLM is CUDA-only and both
+roles share one HF forward.
 
 ## Scaling up
 
