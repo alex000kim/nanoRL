@@ -150,7 +150,8 @@ class VLLMGenerator:
                 mask[len(p_ids):] = 1.0
                 trajs.append(Trajectory(states=full, actions=full.clone(),
                                         old_logp=torch.tensor(lp, dtype=torch.float32),
-                                        rewards=torch.zeros(full.shape[0]), mask=mask))
+                                        rewards=torch.zeros(full.shape[0]), mask=mask,
+                                        truncated=cand.finish_reason != "stop"))
         return trajs
 
     def logprobs(self, batch):
@@ -294,7 +295,7 @@ class HFPolicy(nn.Module):
             gen = out[:, in_len:]
 
             # assemble each row's full (prompt+completion) sequence, stop-token-truncated
-            fulls, masks = [], []
+            fulls, masks, truncs = [], [], []
             for b in range(len(chunk)):
                 row_prompt = enc["input_ids"][b][enc["attention_mask"][b].bool()]
                 comp = gen[b]
@@ -306,6 +307,7 @@ class HFPolicy(nn.Module):
                 m[row_prompt.shape[0] : row_prompt.shape[0] + comp.shape[0]] = 1.0
                 fulls.append(full)
                 masks.append(m)
+                truncs.append(not len(hit))   # ran out of budget mid-thought
             # score the chunk in micro_batch-sized sub-chunks for old_logp
             Lc = max(f.shape[0] for f in fulls)
             padded = torch.full((len(fulls), Lc), self.pad_id, dtype=fulls[0].dtype)
@@ -317,7 +319,8 @@ class HFPolicy(nn.Module):
             for b, (full, m) in enumerate(zip(fulls, masks)):
                 trajs.append(Trajectory(states=full, actions=full.clone(),
                                         old_logp=logp_chunk[b, : full.shape[0]],
-                                        rewards=torch.zeros(full.shape[0]), mask=m))
+                                        rewards=torch.zeros(full.shape[0]), mask=m,
+                                        truncated=truncs[b]))
         return trajs
 
     @torch.no_grad()

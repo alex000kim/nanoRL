@@ -16,6 +16,8 @@ class Trajectory:
     old_logp : [T]      logπ_old(a|s) captured at rollout time (no grad)
     rewards  : [T]      per-step reward (only the terminal step is nonzero for an LLM)
     mask     : [T]      1 on decision steps, 0 on prompt tokens / padding / post-EOS
+    truncated: hit the token budget without emitting a stop token — its answer never
+               appeared, so it must not be scored like an ordinary wrong answer
     """
 
     states: torch.Tensor
@@ -23,6 +25,7 @@ class Trajectory:
     old_logp: torch.Tensor
     rewards: torch.Tensor
     mask: torch.Tensor
+    truncated: bool = False
 
 
 def _pad_stack(tensors: list[torch.Tensor], T: int, pad_value=0.0) -> torch.Tensor:
@@ -55,6 +58,12 @@ class Batch:
     group_size: int
     returns: torch.Tensor | None = None   # critic target, written by the ppo advantage fn
     temperature: float = 1.0              # sampling temp, so logprob recomputes match it
+    # [N, T] logprobs as reported by whatever engine actually SAMPLED these tokens. Never
+    # old_logp (different kernels, different numerics — that is the bug recompute_old_logp
+    # exists to prevent); it is the true behaviour policy, which is what --tis-clip corrects
+    # against. None in sync mode, where sampling and scoring share one forward.
+    sample_logp: torch.Tensor | None = None
+    truncated: torch.Tensor | None = None  # [N] 1.0 where generation hit the token budget
 
     @classmethod
     def from_groups(cls, groups: list[list[Trajectory]]) -> "Batch":
@@ -70,11 +79,16 @@ class Batch:
         group_id = torch.tensor(
             [p for p in range(n_prompts) for _ in range(group_size)], dtype=torch.long
         )
-        return cls(states, actions, old_logp, rewards, mask, group_id, n_prompts, group_size)
+        b = cls(states, actions, old_logp, rewards, mask, group_id, n_prompts, group_size)
+        b.truncated = torch.tensor([float(tr.truncated) for tr in flat])
+        return b
 
     def to(self, device) -> "Batch":
-        for f in ("states", "actions", "old_logp", "rewards", "mask", "group_id"):
-            setattr(self, f, getattr(self, f).to(device))
+        for f in ("states", "actions", "old_logp", "rewards", "mask", "group_id",
+                  "sample_logp", "truncated"):
+            x = getattr(self, f)
+            if x is not None:
+                setattr(self, f, x.to(device))
         return self
 
     def slice(self, i: int, j: int) -> "Batch":
@@ -82,8 +96,11 @@ class Batch:
         sub = Batch(self.states[i:j], self.actions[i:j], self.old_logp[i:j],
                     self.rewards[i:j], self.mask[i:j], self.group_id[i:j],
                     n_prompts=j - i, group_size=1, temperature=self.temperature)
-        if self.returns is not None:
-            sub.returns = self.returns[i:j]
+        # a chunk that lost sample_logp would silently skip the TIS correction for its tokens
+        for f in ("returns", "sample_logp", "truncated"):
+            x = getattr(self, f)
+            if x is not None:
+                setattr(sub, f, x[i:j])
         return sub
 
     def micro_batches(self, size: int):

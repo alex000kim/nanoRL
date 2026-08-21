@@ -117,6 +117,20 @@ def think_format_reward(prompt, completion, answer) -> float:
     return 1.0 if _FORMAT_RE.search(completion) else 0.0
 
 
+def overlong_penalty(n_gen: int, budget: int, cache: int = 0) -> float:
+    """DAPO's soft overlong punishment: free until the last `cache` tokens of the budget
+    (default a quarter of it), then linear to -1.0 at the budget itself.
+
+    Without it a completion cut off mid-sentence scores exactly like a finished wrong answer,
+    so nothing ever teaches the model to wrap up — the length just grows until every rollout
+    is truncated. Graded rather than a flat penalty on truncation: the gradient has to point
+    somewhere before the cliff, not only at it.
+    """
+    cache = cache or max(1, budget // 4)
+    over = n_gen - (budget - cache)
+    return 0.0 if over <= 0 else -min(over / cache, 1.0)
+
+
 # ---- a tiny safe arithmetic evaluator (compiler-as-environment) ----------- #
 _OPS = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
         ast.Div: operator.truediv, ast.USub: operator.neg}
@@ -211,7 +225,8 @@ class LLMTask:
         return policy.format_prompt(self.build_prompt(p), SYSTEM_PROMPT)
 
     def rollout(self, policy, prompts: list, group_size: int, max_new_tokens: int = 256,
-                temperature: float = 1.0, top_p: float = 1.0) -> Batch:
+                temperature: float = 1.0, top_p: float = 1.0,
+                overlong_coef: float = 0.0) -> Batch:
         texts = [self.prompt_text(policy, p) for p in prompts]
         flat = policy.act(texts, group_size, max_new_tokens=max_new_tokens,
                           temperature=temperature, top_p=top_p)
@@ -225,6 +240,8 @@ class LLMTask:
                 total = 0.0
                 for fn, w in self.reward_fns:
                     total += w * fn(texts[pi], completion, problem)
+                if overlong_coef:   # length shaping is a property of the rollout, not the text
+                    total += overlong_coef * overlong_penalty(int(tr.mask.sum()), max_new_tokens)
                 # terminal reward on the LAST completion token
                 last = int(tr.mask.nonzero()[-1].item())
                 tr.rewards[last] = total
@@ -241,23 +258,37 @@ class LLMTask:
                   f"[sample] reward={float(tr.rewards.sum()):.3f}", flush=True)
         return batch
 
-    def evaluate(self, policy, n: int = 32, max_new_tokens: int = 256) -> dict:
-        """Greedy accuracy on the held-out split, sharded across ranks and reduced."""
+    def evaluate(self, policy, n: int = 32, max_new_tokens: int = 256, k: int = 1) -> dict:
+        """Greedy accuracy on the held-out split, sharded across ranks and reduced.
+
+        k>1 switches to pass@k: k samples per problem at temperature 1, reporting the
+        per-sample rate (acc) alongside the fraction of problems solved at least once
+        (pass_k). Greedy pass@1 cannot separate "the policy learned something" from "the
+        policy sharpened onto what it could already do" — a rising acc with a flat pass_k is
+        the second one, and it is the usual reason a run plateaus.
+        """
         from utils import all_sum
 
         problems = self.eval_data[:n][self.rank :: self.world]
+        hits = solved = 0.0
         if problems:
             texts = [self.prompt_text(policy, p) for p in problems]
             # generate-only: eval never needs old_logp, computing it would double the cost
-            completions = policy.generate(texts, max_new_tokens=max_new_tokens, temperature=0.0)
+            completions = policy.generate([t for t in texts for _ in range(k)],
+                                          max_new_tokens=max_new_tokens,
+                                          temperature=1.0 if k > 1 else 0.0)
             primary = self.reward_fns[0][0]
-            hits = sum(primary(t, c, p) for t, c, p in zip(texts, completions, problems))
-        else:
-            hits = 0.0
+            for i, (t, p) in enumerate(zip(texts, problems)):
+                got = [primary(t, c, p) for c in completions[i * k : (i + 1) * k]]
+                hits += sum(got)
+                solved += float(any(g > 0 for g in got))
         dev = getattr(policy, "device", None)
         tot_hits = float(all_sum(hits, dev))
         tot_n = float(all_sum(len(problems), dev))
-        return {"acc": tot_hits / max(tot_n, 1.0)}
+        out = {"acc": tot_hits / max(tot_n * k, 1.0)}
+        if k > 1:
+            out["pass_k"] = float(all_sum(solved, dev)) / max(tot_n, 1.0)
+        return out
 
 
 class CountdownTask(LLMTask):

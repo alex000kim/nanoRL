@@ -47,6 +47,11 @@ class Config:
     gamma: float = 0.99
     lam: float = 0.95
     eps: float = 0.2                # PPO/GRPO clip range (ignored when inner_epochs==1)
+    eps_high: float = 0.0           # DAPO clip-higher: raise ONLY the upper bound (try 0.28)
+                                    # so low-probability tokens can still grow; 0 -> use eps
+    dual_clip: float = 0.0          # cap the A<0 surrogate at dual_clip*A (try 3.0); 0 -> off
+    skip_zero_adv: bool = True      # skip micro-batches with zero advantage (exact, see
+                                    # optimize) — a whole group that scored uniformly
     kl_coef: float = 0.0            # >0 turns on a frozen reference model
     vf_coef: float = 0.5            # critic loss weight (ppo)
     ent_coef: float = 0.0           # entropy bonus (control exploration)
@@ -57,6 +62,7 @@ class Config:
     max_new_tokens: int = 256
     temperature: float = 1.0
     top_p: float = 1.0
+    overlong_coef: float = 0.0      # weight of the DAPO soft length penalty; 0 -> off
     dtype: str = "bfloat16"         # COMPUTE dtype (autocast); weights stay fp32
     device: str = "cpu"
     lora: bool = False
@@ -72,6 +78,7 @@ class Config:
     seed: int = 0
     eval_every: int = 10
     eval_n: int = 32                # held-out problems / episodes per eval
+    eval_k: int = 1                 # samples per eval problem; >1 reports pass@k at temp 1
     ckpt_every: int = 50            # 0 disables checkpointing entirely
     resume: str = ""                # path to a .pt checkpoint to continue from
     # --- disaggregated async RL (see serve.py). role="" is the synchronous default. ---
@@ -80,6 +87,9 @@ class Config:
                                     # of HF generate. Trainer always scores with HF.
     vllm_gpu_frac: float = 0.85
     vllm_max_len: int = 2048
+    tis_clip: float = 0.0           # truncated importance sampling ceiling (try 2-3); corrects
+                                    # the worker ENGINE's numerics against the trainer's. 0 ->
+                                    # off. See rl_loss; --role trainer only
     trainer_url: str = ""           # rollout workers: http://trainer-0.<job-group>:8000
     serve_port: int = 8000
     max_staleness: int = 2          # reject batches sampled >N versions behind; also sizes the
@@ -167,13 +177,53 @@ def loss_denoms(batch, cfg) -> dict:
             "const": all_sum(batch.mask.shape[0] * float(cfg.max_new_tokens), dev)}
 
 
+def rollout_kwargs(cfg) -> dict:
+    """The knobs task.rollout() takes. ONE definition on purpose: the trainer builds these in
+    sync mode and the worker builds them in async mode, and if they drift the same config
+    computes different rewards depending on which process happened to do the rollout."""
+    if cfg.task == "cartpole":
+        return {}
+    return dict(max_new_tokens=cfg.max_new_tokens, temperature=cfg.temperature,
+                top_p=cfg.top_p, overlong_coef=cfg.overlong_coef)
+
+
+def batch_stats(batch, cfg) -> dict:
+    """Cheap per-batch health metrics (rank 0's shard, so a sample rather than the fleet).
+
+    resp_len is the signature curve of RL-for-reasoning; trunc is what tells you whether
+    --max-new-tokens is strangling it (keep it under ~5%); dead is the fraction of groups
+    that scored uniformly and so carry no gradient at all — it rises at both ends of
+    training and is the honest measure of how much of the batch was wasted.
+    """
+    out = {"resp_len": round(float(batch.mask.sum(-1).float().mean()), 1)}
+    if cfg.model and batch.truncated is not None:   # control episodes end, they don't truncate
+        out["trunc"] = round(float(batch.truncated.float().mean()), 3)
+    if batch.group_size > 1:
+        R = batch.group_terminal_rewards()
+        out["dead"] = round(float((R.std(dim=1) < 1e-6).float().mean()), 3)
+    return out
+
+
 def rl_loss(policy, batch, adv, cfg, ref=None, denoms=None):
     """The clipped surrogate (ratio, clip, min, aggregation, value, KL). Works on a
     micro-batch: pass the whole batch's `denoms` and sum the chunk losses."""
     d = denoms if denoms is not None else loss_denoms(batch, cfg)
     logp = policy.logprobs(batch)                        # recompute under current theta
     ratio = torch.exp(logp - batch.old_logp)             # 1 on the first epoch
-    surr = torch.min(ratio * adv, torch.clamp(ratio, 1 - cfg.eps, 1 + cfg.eps) * adv)
+    hi = cfg.eps_high or cfg.eps                         # DAPO clip-higher when set
+    clipped = torch.clamp(ratio, 1 - cfg.eps, 1 + hi)
+    surr = torch.min(ratio * adv, clipped * adv)
+    if cfg.dual_clip:
+        # For A<0 the UNCLIPPED branch is the min, and it runs to -inf as the ratio grows:
+        # one stale token can own the whole step. Floor that branch at dual_clip*A.
+        surr = torch.where(adv < 0, torch.max(surr, cfg.dual_clip * adv), surr)
+    if cfg.tis_clip and batch.sample_logp is not None:
+        # old_logp is what the sampling WEIGHTS say under the trainer's kernels; sample_logp is
+        # what the engine that actually drew the tokens said. Recomputing fixes the ratio's
+        # denominator but not the fact that the tokens came from a slightly different
+        # distribution. This is the missing importance weight — detached, and truncated
+        # because it is unbounded above and one bad token would otherwise dominate.
+        surr = surr * torch.exp(batch.old_logp - batch.sample_logp).clamp(max=cfg.tis_clip)
 
     if not cfg.model:
         # control: mean over all timesteps (length-weights long episodes, as wanted)
@@ -197,9 +247,19 @@ def rl_loss(policy, batch, adv, cfg, ref=None, denoms=None):
         kl = masked_sum(kl_penalty(logp, ref_logp.detach()), batch.mask) / d["tokens"]
         loss = loss + cfg.kl_coef * kl
 
-    # `ratio_sum` (not a mean) so micro-batch chunks can be summed; optimize() divides once.
+    # Sums (not means) so micro-batch chunks can be added up; optimize() divides once.
+    # entropy is E_{a~pi}[-log pi(a)] estimated on the sampled tokens themselves — exactly
+    # the policy entropy in expectation, for free, instead of a second [N,T,vocab] softmax.
+    # It is the earliest warning of collapse: it falls before the reward does.
+    r = ratio.detach()
     diag = {"loss": loss.item(), "pg": pg_loss.item(),
-            "ratio_sum": masked_sum(ratio.detach(), batch.mask).item()}
+            "ratio_sum": masked_sum(r, batch.mask).item(),
+            "clipfrac_sum": masked_sum(((r < 1 - cfg.eps) | (r > 1 + hi)).float(),
+                                       batch.mask).item(),
+            # how far the sampling policy has drifted from the current one: the number that
+            # says whether --max-staleness is set right
+            "akl_sum": masked_sum((batch.old_logp - logp).detach(), batch.mask).item(),
+            "entropy_sum": masked_sum(-logp.detach(), batch.mask).item()}
     return loss, diag
 
 
@@ -209,15 +269,29 @@ def optimize(policy, opt, batch, adv, cfg, ref=None):
     backward() runs INSIDE the chunk loop so peak memory is O(micro_batch), and gradients
     are SUMmed across ranks against loss_denoms' global denominators, which telescopes to
     exactly the single-GPU gradient. Clipping happens after the all-reduce.
+
+    A chunk whose advantage is identically 0 — every completion in a group scored the same,
+    which is most of them at both ends of training — contributes 0 to the loss and 0 to the
+    gradient, so skipping it is EXACT, not an approximation: `d` is global and deliberately
+    still counts its tokens. Exact only while the loss is pure policy gradient, though; a
+    KL, entropy or value term does not vanish with the advantage, hence `free`.
     """
     d = loss_denoms(batch, cfg)
     size = cfg.micro_batch if cfg.model else 0           # control is small; one chunk
+    free = ref is None and not cfg.ent_coef and batch.returns is None
     opt.zero_grad(set_to_none=True)
-    tot = {"loss": 0.0, "pg": 0.0, "ratio_sum": 0.0}
+    tot = {"loss": 0.0, "pg": 0.0, "ratio_sum": 0.0, "clipfrac_sum": 0.0,
+           "akl_sum": 0.0, "entropy_sum": 0.0}
+    skipped, seen = 0, 0.0
     for i, mb in batch.micro_batches(size):
         n = mb.states.shape[0]
-        loss, diag = rl_loss(policy, mb, adv[i : i + n], cfg, ref, denoms=d)
+        a = adv[i : i + n]
+        if cfg.skip_zero_adv and free and not a.any():
+            skipped += n
+            continue
+        loss, diag = rl_loss(policy, mb, a, cfg, ref, denoms=d)
         loss.backward()                                  # frees this chunk's graph now
+        seen += float(mb.mask.sum())
         for k in tot:
             tot[k] += diag[k]
 
@@ -229,8 +303,14 @@ def optimize(policy, opt, batch, adv, cfg, ref=None):
     opt.step()
 
     dev = batch.mask.device
-    ratio = float(all_sum(tot.pop("ratio_sum"), dev) / d["tokens"])   # sum -> global mean
-    return {**tot, "ratio": ratio, "gnorm": float(gnorm)}
+    # sums -> global (cross-rank, cross-chunk) per-token means. Divided by the tokens actually
+    # SCORED, not d["tokens"]: a skipped chunk contributes no ratio, and dividing it in would
+    # report drift that never happened (ratio is the headline async metric — it has to be the
+    # mean over the tokens it was measured on).
+    den = all_sum(seen, dev).clamp_min(1.0)
+    means = {k: round(float(all_sum(tot.pop(f"{k}_sum"), dev) / den), 4)
+             for k in ("ratio", "clipfrac", "akl", "entropy")}
+    return {**tot, **means, "gnorm": float(gnorm), "skipped": skipped}
 
 
 def validate(cfg: Config) -> None:
@@ -246,6 +326,23 @@ def validate(cfg: Config) -> None:
     if cfg.vllm and not cfg.lora:
         raise ValueError("--vllm requires --lora: weights reach vLLM as a PEFT adapter "
                          "(full fine-tuning would ship the whole model every step).")
+    if cfg.tis_clip and cfg.role != "trainer":
+        raise ValueError("--tis-clip corrects the sampling engine's numerics against the "
+                         "trainer's, so it needs the worker logprobs that only --role trainer "
+                         "receives. In sync mode both come from one forward and the weight "
+                         "would be exactly 1 — a silent no-op.")
+    if cfg.tis_clip and cfg.tis_clip < 1.0:
+        raise ValueError(f"--tis-clip {cfg.tis_clip} is a CEILING on an importance ratio and "
+                         f"must be >= 1 (2-3 is usual); 0 disables it.")
+    if cfg.dual_clip and cfg.dual_clip <= 1.0:
+        raise ValueError(f"--dual-clip {cfg.dual_clip} must be > 1: it floors the A<0 "
+                         f"surrogate at dual_clip*A, and <=1 would clip inside the trust "
+                         f"region. 3.0 is usual; 0 disables it.")
+    if cfg.eps_high and cfg.eps_high < cfg.eps:
+        raise ValueError(f"--eps-high {cfg.eps_high} < --eps {cfg.eps}: clip-higher RAISES the "
+                         f"upper bound (try 0.28 against eps 0.2); 0 makes the clip symmetric.")
+    if cfg.eval_k < 1:
+        raise ValueError(f"--eval-k must be >= 1 (got {cfg.eval_k}); 1 is greedy pass@1.")
     if cfg.ent_coef and cfg.model:
         raise ValueError("--ent-coef only applies to control (MLP) policies; HFPolicy has no "
                          "entropy() and the bonus would be silently skipped.")
@@ -355,6 +452,9 @@ class AsyncSource:
         m = batch.mask.bool().cpu()
         self.mismatch = (float((exact.cpu()[m] - batch.old_logp.cpu()[m]).abs().mean())
                          if m.any() else 0.0)
+        # the worker's own logprobs are the BEHAVIOUR policy — never old_logp, but the
+        # numerator --tis-clip needs to correct for having sampled from a different engine
+        batch.sample_logp = batch.old_logp
         batch.old_logp = exact.to(batch.mask.device)
         return batch, lag
 
@@ -410,8 +510,7 @@ def rollout_worker(cfg: Config):
     if theirs and theirs != mine:
         raise RuntimeError(f"worker/trainer config mismatch — the data split would differ.\n"
                            f"  trainer: {theirs}\n  worker : {mine}")
-    roll_kw = {} if cfg.task == "cartpole" else dict(
-        max_new_tokens=cfg.max_new_tokens, temperature=cfg.temperature, top_p=cfg.top_p)
+    roll_kw = rollout_kwargs(cfg)
 
     import urllib.error
 
@@ -499,8 +598,8 @@ def train(cfg: Config):
             print(f"[dist] {world} ranks x {local_prompts} prompts x {cfg.group_size} "
                   f"completions = {cfg.n_prompts * cfg.group_size} sequences/step", flush=True)
 
-    roll_kw = {} if cfg.task == "cartpole" else dict(
-        max_new_tokens=cfg.max_new_tokens, temperature=cfg.temperature, top_p=cfg.top_p)
+    roll_kw = rollout_kwargs(cfg)
+    eval_kw = {"k": cfg.eval_k} if cfg.model else {}    # pass@k is an LLM-task notion
     # the one-line fork between sync and async
     source = (AsyncSource(cfg, rank, world) if cfg.role == "trainer"
               else SyncSource(task, cfg, roll_kw, local_prompts))
@@ -531,9 +630,10 @@ def train(cfg: Config):
 
         rew = float(all_sum(batch.reward_mean(), cfg.device)) / world   # mean over all ranks
         if log:
-            log.log(step, reward=rew, staleness=staleness, **diag, **source.stats())
+            log.log(step, reward=rew, staleness=staleness, **diag,
+                    **batch_stats(batch, cfg), **source.stats())
         if cfg.eval_every and step % cfg.eval_every == 0 and hasattr(task, "evaluate"):
-            ev = task.evaluate(policy, n=cfg.eval_n)         # sharded + reduced inside
+            ev = task.evaluate(policy, n=cfg.eval_n, **eval_kw)   # sharded + reduced inside
             if log:
                 log.log(step, **{f"eval_{k}": v for k, v in ev.items()})
         if cfg.ckpt_every and step and step % cfg.ckpt_every == 0 and is_main():

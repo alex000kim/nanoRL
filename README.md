@@ -2,7 +2,7 @@
 
 One RL training loop that scales from a laptop CPU to a GPU cluster. **No GPU required**:
 the same disaggregated trainer/worker setup that runs on 16 GPUs runs as two pods on your
-laptop. ~1,800 lines across 7 files, no Ray, TRL or DeepSpeed. Like
+laptop. ~2,050 lines across 7 files, no Ray, TRL or DeepSpeed. Like
 [nanoGPT](https://github.com/karpathy/nanoGPT), a codebase to fork, not a library to import.
 
 ```python
@@ -71,21 +71,38 @@ fell from 0.500 to 0.188.
 
 ![Async health](assets/async_health.png)
 
+## Knobs
+
+Off by default, a few lines each:
+
+| Flag | |
+|---|---|
+| `--tis-clip 2` | async only: the trainer recomputes `old_logp`, but vLLM still *sampled* the tokens. This is the importance weight for that leftover gap, truncated |
+| `--eps-high 0.28` | clip-higher: raise the ceiling only, so unlikely-but-good tokens can still grow |
+| `--dual-clip 3` | floor the surrogate where the advantage is negative and PPO's clip is one-sided |
+| `--overlong-coef 0.5` | penalize completions crowding the token budget — a truncated answer otherwise scores like a finished wrong one |
+| `--eval-k 8` | pass@k at temperature 1 instead of greedy pass@1 |
+
+`--skip-zero-adv` is on: a group where every completion scored the same has zero advantage,
+so skip its forward/backward. Purely a speedup, since the loss denominators still count its
+tokens. New log columns: `entropy` (falls before the reward does), `clipfrac`, `akl` (drift
+from the sampling policy), `resp_len`, `trunc`, `dead`.
+
 ## Layout
 
 ```
 algos.py    ~90   advantage estimators: reinforce / baseline / ppo (GAE) / grpo / rloo
-core.py    ~110   Trajectory + Batch
+core.py    ~120   Trajectory + Batch
 utils.py   ~170   masked reductions, returns/GAE, dist plumbing, CSV logger
 serve.py   ~250   async transport: weight publishing, rollout queue, staleness rejection
-tasks.py   ~310   CartPole + Countdown/GSM8K; task = sample + rollout + reward fns
-model.py   ~330   MLPPolicy, HFPolicy (train + score), VLLMGenerator (rollout only)
-train.py   ~560   the loop: rollout, advantage, clipped update, publish
+tasks.py   ~340   CartPole + Countdown/GSM8K; task = sample + rollout + reward fns
+model.py   ~380   MLPPolicy, HFPolicy (train + score), VLLMGenerator (rollout only)
+train.py   ~700   the loop: rollout, advantage, clipped update, publish
 ```
 
 `--role trainer` on one box and `--role rollout` on the others talk over stdlib HTTP.
 `max_staleness` is the only knob: rejection bound, queue depth and snapshot count at once.
-44 CPU-only tests cover all of it: `python tests/test_nanorl.py`.
+59 CPU-only tests cover all of it: `python tests/test_nanorl.py`.
 
 ## Your model, your dataset
 
