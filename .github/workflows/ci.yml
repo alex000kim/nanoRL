@@ -17,9 +17,10 @@ jobs:
         run: |
           pip install -q uv
           uv pip install --system --index-url https://download.pytorch.org/whl/cpu torch
-          uv pip install --system transformers gymnasium numpy pyyaml
+          uv pip install --system transformers "datasets<4" gymnasium numpy pyyaml
       - name: Run tests
-        # the LLM test downloads a ~2MB tiny model; require it rather than let it skip silently
+        # these tests download a ~2MB tiny model and the 12MB RLVR-IFeval split; require them
+        # rather than let them skip silently
         env:
           NANORL_REQUIRE_LLM_TEST: "1"
         run: python tests/test_nanorl.py

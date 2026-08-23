@@ -16,7 +16,7 @@ resources:
   cpus: 4+                   # 4+4, not 5+4: kube-system already reserves ~1.05 of 10
   memory: 6+
 envs:
-  CFG: configs/countdown_local_cpu.yaml
+  CFG: configs/ifeval_local_cpu.yaml
   NANORL_TOKEN: nanorl-local
 workdir: .
 setup: |
@@ -38,7 +38,7 @@ resources:
   cpus: 4+
   memory: 5+
 envs:
-  CFG: configs/countdown_local_cpu.yaml
+  CFG: configs/ifeval_local_cpu.yaml
   NANORL_TOKEN: nanorl-local
 workdir: .
 setup: |

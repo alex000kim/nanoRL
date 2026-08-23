@@ -1,0 +1,47 @@
+# Instruction following on a laptop CPU: real prompts, code-checked constraints, no GPU.
+#   python train.py --config configs/ifeval_local_cpu.yaml          # one process
+#   sky local up && sky jobs launch sky/local_jobgroup.yaml         # trainer + worker pods
+# Held-out 0.448 -> 0.604 in 86 min; on a matched 64-prompt before/after, strict accuracy
+# (all 3 constraints) 0.109 -> 0.250. Difficulty lever: IFEVAL_K and the constraint pool in
+# tasks.py, which carry the measured per-constraint rates.
+task: ifeval
+algo: grpo
+
+model: Qwen/Qwen3-0.6B
+
+n_prompts: 2           # per worker submission; 2 x 8 = 16 sequences is the whole batch
+group_size: 8          # < 8 leaves too many groups with zero reward variance, hence no grad
+micro_batch: 2         # scoring fwd+bwd chunk; CPU RAM is the bound
+gen_batch: 8           # trainer-side eval generation only
+
+max_staleness: 2
+pop_timeout: 1800.0
+serve_port: 8000
+
+lora: true
+lora_r: 16
+grad_ckpt: false
+dtype: float32         # laptop CPUs have no native bf16: fp32 is measurably faster
+device: cpu
+
+steps: 61
+inner_epochs: 4       # reuse each (expensive) generation batch: generation dominates
+                       # wall-clock, and at 1 the PPO clip is inert (clipfrac measured 0.0000)
+lr: 3.0e-5             # Countdown's 1e-5 barely moved this task; gnorm sat 2.5-5x over
+                       # max_grad_norm, so every update was throttled
+eps: 0.2
+kl_coef: 0.0
+length_norm: true
+norm_std: true
+max_new_tokens: 128    # completions run ~84 tokens: enough to satisfy every shipped constraint
+temperature: 0.8
+top_p: 1.0
+think: false           # Qwen3-0.6B scores 0.378 on IFEval without thinking, 0.109 with it
+
+seed: 0
+eval_every: 15         # evals only when step % eval_every == 0, so keep steps = 1 + k*this
+eval_n: 32             # +-0.05 of noise; raise for a cleaner curve, it costs ~3 min/eval
+ckpt_every: 0
+n_examples: 2000
+debug_samples: 2
+out: runs/ifeval_local_cpu

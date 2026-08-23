@@ -196,6 +196,7 @@ class LLMTask:
     Subclasses load `data`/`eval_data`, define `build_prompt`, and pick `reward_fns`."""
 
     reward_fns: list = []
+    system_prompt: str = SYSTEM_PROMPT   # overridden by tasks that want no <answer> tags
 
     def build_prompt(self, problem) -> str:
         raise NotImplementedError
@@ -222,7 +223,7 @@ class LLMTask:
         return out
 
     def prompt_text(self, policy, p) -> str:
-        return policy.format_prompt(self.build_prompt(p), SYSTEM_PROMPT)
+        return policy.format_prompt(self.build_prompt(p), self.system_prompt)
 
     def rollout(self, policy, prompts: list, group_size: int, max_new_tokens: int = 256,
                 temperature: float = 1.0, top_p: float = 1.0,
@@ -291,6 +292,118 @@ class LLMTask:
         return out
 
 
+# ========================================================================== #
+# Instruction following — verifiable constraints on real prompts (RLVR)
+# ========================================================================== #
+# Prompts come from allenai/RLVR-IFeval (Tulu 3); the constraints are attached here so their
+# difficulty is a knob rather than a property of the row. Each is checked by a couple of lines
+# of Python — the interpreter is the reward model, exactly as the calculator is for Countdown.
+#
+# Why THREE constraints and a graded reward, when the dataset ships one per row: a 0.6B model
+# is deterministic per prompt. Measured on Qwen3-0.6B, one binary constraint leaves 58% of
+# groups scoring identically — no advantage, no gradient — while three with partial credit
+# leaves 17%. K is the difficulty lever: raise it for a denser signal, lower it for a harder
+# task.
+IFEVAL_K = 3
+
+def _n_words(text: str) -> int:
+    return len(re.findall(r"\b[\w'-]+\b", text))
+
+
+# (instruction shown to the model, verifier). Two properties are load-bearing.
+#
+# MUTUALLY SATISFIABLE: any K of these can hold at once, or some prompts are unwinnable by
+# construction. That is why there is exactly one length constraint, and why the phrase/word
+# checks are case-insensitive (they have to survive "write in capitals").
+#
+# SPREAD ACROSS DIFFICULTY: measured per-constraint on Qwen3-0.6B, shown below. A constraint
+# the model already satisfies is paid for free and contributes no gradient — an earlier pool
+# of five such (p>=0.91) started training at 0.693 with almost nothing left to learn.
+IFEVAL_CONSTRAINTS: list[tuple] = [
+    ("Answer with around 40 words.",                                              # p=0.09
+     lambda c: abs(_n_words(c) - 40) <= 8),
+    ('Use the word "however" exactly twice.',                                     # p~0.26
+     lambda c: len(re.findall(r"\bhowever\b", c.lower())) == 2),
+    ("Use exactly two bullet points, each on its own line starting with '- '.",   # p~0.27
+     lambda c: len(re.findall(r"^\s*-\s+\S", c, re.MULTILINE)) == 2),
+    ('Never use the words "the" or "and".',                                       # p=0.33
+     lambda c: not re.search(r"\b(the|and)\b", c.lower())),
+    ("Write exactly 3 sentences.",                                                # p~0.46
+     lambda c: len([s for s in re.split(r"(?<=[.!?])\s+", c.strip()) if s.strip()]) == 3),
+    ("Begin your response with the word Yes or the word No.",                     # p~0.5
+     lambda c: bool(re.match(r"\W*(yes|no)\b", c.strip().lower()))),
+    ("Do not use any commas.",                                                    # p=0.67
+     lambda c: c.strip() != "" and "," not in c),
+    ("Write your entire response in capital letters.",                            # p~0.75
+     lambda c: c.strip() != "" and c == c.upper()),
+    ("Finish with the exact phrase: Hope this helps.",                            # p=0.80
+     lambda c: c.strip().rstrip('".').lower().endswith("hope this helps")),
+]
+
+
+def ifeval_reward(prompt, completion, answer) -> float:
+    """Fraction of this prompt's constraints that hold. Graded on purpose: a binary
+    all-or-nothing check collapses the within-group variance GRPO needs."""
+    ids = answer["cids"]
+    return sum(float(bool(IFEVAL_CONSTRAINTS[i][1](completion))) for i in ids) / len(ids)
+
+
+def ifeval_strict_reward(prompt, completion, answer) -> float:
+    """IFEval's own metric: every constraint or nothing. Reported, never trained on."""
+    return float(ifeval_reward(prompt, completion, answer) == 1.0)
+
+
+class IFEvalTask(LLMTask):
+    """Real instruction-following text, scored by code. No reward model, no judge."""
+
+    # the shared prompt asks for <answer> tags, which would fight constraints like
+    # "wrap your entire response in quotation marks"
+    system_prompt = ("You are a helpful assistant. Follow every formatting constraint in the "
+                     "request exactly.")
+
+    def __init__(self, n_examples: int = 2000, seed: int = 0, n_eval: int = 128,
+                 rank: int = 0, world: int = 1):
+        import random
+
+        from datasets import load_dataset
+
+        self.rank, self.world = rank, world
+        ds = load_dataset("allenai/RLVR-IFeval", split="train")
+        rng = random.Random(seed)
+        rows, seen = [], set()
+        for ex in ds:
+            # Strip the row's own constraint so only OUR constraints are asked for and scored.
+            # `constraint` is a TEMPLATE ("...the word {word}..."), so it matches the prompt
+            # verbatim on only a third of rows; the rest are skipped rather than half-stripped,
+            # which would leave an unscored — and sometimes contradictory — extra instruction
+            # in the prompt. Slicing at the ends keeps the stem a whole sentence.
+            prompt, con = ex["messages"][0]["content"], ex["constraint"]
+            i = prompt.find(con)
+            if i < 0:
+                continue
+            stem = (prompt[i + len(con):] if i == 0 else prompt[:i]).strip()
+            # Dedup is load-bearing, not tidiness: the same Tulu prompt appears under several
+            # different constraints (2,347 rows are only 816 distinct stems), so without this
+            # the eval holdout and the training shard share prompts and eval silently inflates.
+            # bound in CHARS so loading stays cheap: this holds prompts near 42 tokens (p90 77)
+            if 40 < len(stem) < 400 and stem not in seen:
+                seen.add(stem)
+                rows.append(stem)
+            if len(rows) >= n_examples:
+                break
+        rng.shuffle(rows)
+        # Constraints are drawn from a seeded RNG in a fixed order, so a trainer and its
+        # rollout workers derive identical prompts without sending any of this over the wire.
+        data = [{"stem": s, "cids": sorted(rng.sample(range(len(IFEVAL_CONSTRAINTS)),
+                                                      IFEVAL_K))} for s in rows]
+        self._split(data, n_eval)
+        self.reward_fns = [(ifeval_reward, 1.0)]
+
+    def build_prompt(self, p: dict) -> str:
+        reqs = "\n".join(f"- {IFEVAL_CONSTRAINTS[i][0]}" for i in p["cids"])
+        return f"{p['stem']}\n\nConstraints:\n{reqs}"
+
+
 class CountdownTask(LLMTask):
     def __init__(self, split: str = "train", n_examples: int = 2000, seed: int = 0,
                  n_eval: int = 128, rank: int = 0, world: int = 1):
@@ -334,6 +447,8 @@ def make_task(name: str, **kw):
         return CartPoleTask(**keep("max_steps", "gamma", "rank", "world"))
     if name == "countdown":
         return CountdownTask(**keep("n_examples", "seed", "n_eval", "rank", "world"))
+    if name == "ifeval":
+        return IFEvalTask(**keep("n_examples", "seed", "n_eval", "rank", "world"))
     if name == "gsm8k":
         return GSM8KTask(**keep("n_examples", "seed", "n_eval", "rank", "world"))
     raise ValueError(f"unknown task {name!r}")

@@ -178,6 +178,111 @@ def test_countdown_reward():
     assert countdown_reward("", "<answer>4*5+3 = 23</answer>", prob) == 1.0
 
 
+# --------------------------------------------------------------------------- #
+# instruction following (ifeval): the verifiers ARE the reward model
+# --------------------------------------------------------------------------- #
+def test_ifeval_every_constraint_accepts_and_rejects():
+    """Each verifier must actually discriminate. One that always returns True is a constraint
+    the model is paid for for free (measured: 'all lowercase' alone scores 1.00 on Qwen3-0.6B
+    and leaves 100% of groups with no gradient); one that always returns False is unwinnable."""
+    from tasks import IFEVAL_CONSTRAINTS
+    good = [' '.join(['word'] * 40), 'however so however', '- one\n- two',
+            'a quick brown fox jumps', 'One. Two. Three.', 'Yes indeed it is',
+            'no commas here', 'SHOUTING LOUDLY', 'sure. Hope this helps.']
+    bad = ['too short', 'however once', '- only one', 'the cat and the dog',
+           'One. Two.', 'Maybe it is', 'yes, commas', 'quiet voice', 'ends wrong']
+    assert len(good) == len(bad) == len(IFEVAL_CONSTRAINTS)
+    for (text, fn), g, b in zip(IFEVAL_CONSTRAINTS, good, bad):
+        assert fn(g), f"{text!r} rejected a valid completion {g!r}"
+        assert not fn(b), f"{text!r} accepted an invalid completion {b!r}"
+
+
+def test_ifeval_pool_cannot_produce_unwinnable_prompts():
+    """Any K of the pool land on one prompt together, so contradictory pairs would make some
+    prompts impossible — and an impossible prompt's group is dead exactly like a trivial one.
+    Two invariants keep that from happening."""
+    from tasks import IFEVAL_CONSTRAINTS
+    # 1. exactly ONE word-count constraint: two ("around 40 words" + "at most 20 words")
+    #    is the obvious way to make a prompt unsatisfiable.
+    assert sum("words." in t and any(ch.isdigit() for ch in t)
+               for t, _ in IFEVAL_CONSTRAINTS) == 1
+    # 2. the phrase/word checks must survive "write in capital letters", i.e. be
+    #    case-insensitive — otherwise capitals contradicts three other constraints at once.
+    caps = "YES HOWEVER IT IS SO HOWEVER. SOMETHING MORE. HOPE THIS HELPS."
+    by = dict(IFEVAL_CONSTRAINTS)
+    assert by["Write your entire response in capital letters."](caps)
+    assert by["Finish with the exact phrase: Hope this helps."](caps)
+    assert by['Use the word "however" exactly twice.'](caps)
+    assert by["Begin your response with the word Yes or the word No."](caps)
+    assert by["Write exactly 3 sentences."](caps)
+
+
+def test_ifeval_reward_is_graded_not_binary():
+    """THE design point. A 0.6B model answers a given prompt the same way every time, so a
+    single all-or-nothing check makes whole groups score identically and GRPO's advantage is
+    exactly 0 (measured: 58% of groups dead at K=1 vs 17% at K=3). Partial credit is what
+    puts variance back."""
+    from tasks import IFEVAL_CONSTRAINTS, ifeval_reward, ifeval_strict_reward
+    # look constraints up by text, so tuning the pool cannot silently invert this test
+    want = ["Do not use any commas.", "Write your entire response in capital letters.",
+            "Begin your response with the word Yes or the word No."]
+    idx = [i for i, (t, _) in enumerate(IFEVAL_CONSTRAINTS) if t in want]
+    p = {"cids": idx}
+    assert len(idx) == 3
+    assert ifeval_reward("", "YES IT IS SO", p) == 1.0
+    assert abs(ifeval_reward("", "YES IT IS, SO", p) - 2 / 3) < 1e-9   # only the comma fails
+    assert abs(ifeval_reward("", "maybe, quiet", p) - 0.0) < 1e-9
+    # strict is IFEval's own metric: reported, never trained on
+    assert ifeval_strict_reward("", "YES IT IS SO", p) == 1.0
+    assert ifeval_strict_reward("", "YES IT IS, SO", p) == 0.0
+
+
+def test_ifeval_prompt_states_the_constraints_it_scores():
+    """The model can only satisfy what it was told. If build_prompt and the reward ever drift
+    apart the task becomes unlearnable while still logging a plausible reward."""
+    from tasks import IFEVAL_CONSTRAINTS, IFEvalTask
+    p = {"stem": "Explain photosynthesis.", "cids": [1, 3]}
+    text = IFEvalTask.build_prompt(None, p)
+    for i in p["cids"]:
+        assert IFEVAL_CONSTRAINTS[i][0] in text
+    for i in set(range(len(IFEVAL_CONSTRAINTS))) - set(p["cids"]):
+        assert IFEVAL_CONSTRAINTS[i][0] not in text, "prompt lists a constraint it is not scored on"
+
+
+def test_ifeval_assignment_is_identical_across_processes():
+    """Constraints are drawn from a seeded RNG rather than shipped over the wire, so a rollout
+    worker MUST derive exactly what the trainer derived. If these diverge the worker optimizes
+    constraints the trainer never scores, and nothing in the metrics would show it."""
+    try:
+        from tasks import IFEvalTask
+        a = IFEvalTask(n_examples=200, seed=0, n_eval=8)
+        b = IFEvalTask(n_examples=200, seed=0, n_eval=8)   # the "worker"
+    except Exception as e:
+        if os.environ.get("NANORL_REQUIRE_LLM_TEST"):
+            raise
+        print(f"  (SKIPPED — dataset unavailable: {type(e).__name__})")
+        _SKIPPED.append("test_ifeval_assignment_is_identical_across_processes")
+        return
+    assert a.data[:5] == b.data[:5] and a.eval_data == b.eval_data
+    c = IFEvalTask(n_examples=200, seed=1, n_eval=8)
+    assert a.data[:5] != c.data[:5], "a different --seed must give a different task"
+    # the eval holdout must never be handed out for training
+    assert not ({r["stem"] for r in a.eval_data} & {r["stem"] for r in a.data})
+    from tasks import IFEVAL_K
+    assert all(len(r["cids"]) == IFEVAL_K == len(set(r["cids"])) for r in a.data[:50])
+
+
+def test_ifeval_system_prompt_does_not_demand_answer_tags():
+    """The shared RLVR system prompt asks for <answer> tags, which directly contradicts
+    constraints like 'wrap your entire response in quotation marks'. Making system_prompt
+    per-task must not change it for the tag-based tasks."""
+    from tasks import SYSTEM_PROMPT, CountdownTask, GSM8KTask, IFEvalTask, LLMTask
+    assert "<answer>" not in IFEvalTask.system_prompt
+    assert IFEvalTask.system_prompt != SYSTEM_PROMPT
+    for t in (LLMTask, CountdownTask, GSM8KTask):
+        assert t.system_prompt is SYSTEM_PROMPT, f"{t.__name__} lost the <answer>-tag prompt"
+
+
 def test_gsm8k_reward():
     prob = {"value": 18.0}
     assert gsm8k_reward("", "<answer>18</answer>", prob) == 1.0
