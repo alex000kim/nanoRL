@@ -201,12 +201,9 @@ def batch_stats(batch, cfg) -> dict:
     if batch.group_size > 1:
         R = batch.group_terminal_rewards()
         out["dead"] = round(float((R.std(dim=1) < 1e-6).float().mean()), 3)
-        # `levels` is dead's continuous form: the mean count of DISTINCT reward values in a
-        # group. It decides whether reward reshaping can do anything at all. Under norm_std the
-        # advantage is (R - mean) / std, and on a two-level group that is exactly
-        # sign(a-b) * sqrt(n_b/n_a) -- the two reward VALUES cancel, leaving only which samples
-        # won and how many. So any monotone reshaping of the reward is a bit-level no-op
-        # wherever levels == 2, and `dead` cannot show it because those groups are not dead.
+        # distinct reward values per group. Under norm_std a two-level group's advantage is
+        # sign(a-b)*sqrt(n_b/n_a), so any monotone reward reshaping is a no-op at levels==2.
+        # `dead` cannot show this: those groups are not dead.
         out["levels"] = round(float(
             torch.tensor([len(torch.unique(r)) for r in R], dtype=torch.float).mean()), 2)
     return out
@@ -607,12 +604,8 @@ def train(cfg: Config):
                   f"completions = {cfg.n_prompts * cfg.group_size} sequences/step", flush=True)
 
     roll_kw = rollout_kwargs(cfg)
-    # max_new_tokens too, not just k. evaluate() defaults it to 256 while rollouts use
-    # cfg.max_new_tokens, so the policy was OPTIMIZED under one token budget and SCORED under
-    # another -- a config knob that silently did not apply to half the run. It is also most of
-    # the eval bill: HF generate runs until EVERY sequence in the batch stops, so with a 6%
-    # per-sequence truncation rate a 32-wide batch hits the cap ~86% of the time and pays the
-    # full 256 steps whatever the mean completion length is.
+    # max_new_tokens too: evaluate() defaults to 256 while rollouts use cfg's value, so the
+    # policy was optimized under one token budget and scored under another.
     eval_kw = ({"k": cfg.eval_k, "max_new_tokens": cfg.max_new_tokens} if cfg.model else {})
     # the one-line fork between sync and async
     source = (AsyncSource(cfg, rank, world) if cfg.role == "trainer"

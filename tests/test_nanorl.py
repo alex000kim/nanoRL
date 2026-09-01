@@ -238,15 +238,9 @@ def test_ifeval_reward_is_graded_not_binary():
 
 
 def test_norm_std_erases_reward_spacing_on_two_level_groups():
-    """The invariant that decides whether ANY reward reshaping is worth running.
-
-    With norm_std=True the group advantage is (R - mean) / std. On a group holding only two
-    distinct reward values a and b with counts n_a, n_b, that works out to
-    sign(a-b) * sqrt(n_b/n_a) -- independent of a and b. So --reward-weighting rarity, a soft
-    scorer, or any shaping exponent are all EXACTLY inert on such groups, and no existing
-    diagnostic says so: the group is not dead, the reward moves, the loss moves, and the
-    gradient does not. This is why `levels` is logged next to `dead`.
-    """
+    """On a two-level group, (R-mean)/std reduces to sign(a-b)*sqrt(n_b/n_a) -- independent of
+    the reward VALUES. So any monotone reshaping is exactly inert there, and nothing at runtime
+    says so: reward moves, loss moves, gradient does not. Hence `levels` beside `dead`."""
     import torch
 
     from algos import grpo
@@ -268,11 +262,9 @@ def test_norm_std_erases_reward_spacing_on_two_level_groups():
         got = grpo(batch_of([r ** exp for r in two]), None, norm_std=True)[:, 0]
         assert torch.allclose(ref, got, atol=1e-3), (
             f"exponent {exp} changed a two-level group under norm_std -- derivation is wrong")
-    # Without std normalization the spacing survives: the only regime where reshaping can act.
     lo = grpo(batch_of(two), None, norm_std=False)[:, 0].abs().max()
     hi = grpo(batch_of([r ** 3 for r in two]), None, norm_std=False)[:, 0].abs().max()
     assert hi > lo * 1.5, "reshaping must reprice the group when norm_std is off"
-    # Three or more levels: norm_std keeps the RELATIVE spacing, so reshaping bites again.
     three = [1 / 3, 2 / 3, 1.0, 2 / 3, 1.0, 1 / 3, 2 / 3, 1.0]
     a1 = grpo(batch_of(three), None, norm_std=True)[:, 0]
     a3 = grpo(batch_of([r ** 3 for r in three]), None, norm_std=True)[:, 0]
@@ -280,16 +272,14 @@ def test_norm_std_erases_reward_spacing_on_two_level_groups():
 
 
 def test_eval_uses_the_configured_token_budget():
-    """cfg.max_new_tokens has to reach EVAL, not just rollouts. It did not: evaluate() carries
-    its own default of 256 while rollout_kwargs passes cfg's value, so the policy was optimized
-    under one budget and scored under another, and the knob looked applied."""
+    """cfg.max_new_tokens must reach eval, not just rollouts: evaluate() defaults to 256, so the
+    knob looked applied while half the run ignored it."""
     import train as T
 
     cfg = T.Config(task="ifeval", model="Qwen/Qwen3-0.6B", max_new_tokens=128, eval_k=1)
     assert T.rollout_kwargs(cfg)["max_new_tokens"] == 128
     eval_kw = {"k": cfg.eval_k, "max_new_tokens": cfg.max_new_tokens} if cfg.model else {}
     assert eval_kw["max_new_tokens"] == cfg.max_new_tokens == 128
-    # control tasks have no token budget at all and must not be handed one
     assert T.rollout_kwargs(T.Config(task="cartpole", model="")) == {}
 
 
