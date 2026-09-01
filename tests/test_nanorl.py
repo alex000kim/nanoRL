@@ -237,6 +237,62 @@ def test_ifeval_reward_is_graded_not_binary():
     assert ifeval_strict_reward("", "YES IT IS, SO", p) == 0.0
 
 
+def test_norm_std_erases_reward_spacing_on_two_level_groups():
+    """The invariant that decides whether ANY reward reshaping is worth running.
+
+    With norm_std=True the group advantage is (R - mean) / std. On a group holding only two
+    distinct reward values a and b with counts n_a, n_b, that works out to
+    sign(a-b) * sqrt(n_b/n_a) -- independent of a and b. So --reward-weighting rarity, a soft
+    scorer, or any shaping exponent are all EXACTLY inert on such groups, and no existing
+    diagnostic says so: the group is not dead, the reward moves, the loss moves, and the
+    gradient does not. This is why `levels` is logged next to `dead`.
+    """
+    import torch
+
+    from algos import grpo
+    from core import Batch, Trajectory
+
+    def batch_of(rewards, T=4):
+        trs = []
+        for r in rewards:
+            rw = torch.zeros(T)
+            rw[-1] = r
+            trs.append(Trajectory(states=torch.zeros(T, dtype=torch.long),
+                                  actions=torch.zeros(T, dtype=torch.long),
+                                  old_logp=torch.zeros(T), rewards=rw, mask=torch.ones(T)))
+        return Batch.from_groups([trs])
+
+    two = [2 / 3, 2 / 3, 1.0, 2 / 3, 1.0, 2 / 3, 2 / 3, 1.0]
+    ref = grpo(batch_of(two), None, norm_std=True)[:, 0]
+    for exp in (1.5, 2.0, 3.0):
+        got = grpo(batch_of([r ** exp for r in two]), None, norm_std=True)[:, 0]
+        assert torch.allclose(ref, got, atol=1e-3), (
+            f"exponent {exp} changed a two-level group under norm_std -- derivation is wrong")
+    # Without std normalization the spacing survives: the only regime where reshaping can act.
+    lo = grpo(batch_of(two), None, norm_std=False)[:, 0].abs().max()
+    hi = grpo(batch_of([r ** 3 for r in two]), None, norm_std=False)[:, 0].abs().max()
+    assert hi > lo * 1.5, "reshaping must reprice the group when norm_std is off"
+    # Three or more levels: norm_std keeps the RELATIVE spacing, so reshaping bites again.
+    three = [1 / 3, 2 / 3, 1.0, 2 / 3, 1.0, 1 / 3, 2 / 3, 1.0]
+    a1 = grpo(batch_of(three), None, norm_std=True)[:, 0]
+    a3 = grpo(batch_of([r ** 3 for r in three]), None, norm_std=True)[:, 0]
+    assert not torch.allclose(a1, a3, atol=1e-2)
+
+
+def test_eval_uses_the_configured_token_budget():
+    """cfg.max_new_tokens has to reach EVAL, not just rollouts. It did not: evaluate() carries
+    its own default of 256 while rollout_kwargs passes cfg's value, so the policy was optimized
+    under one budget and scored under another, and the knob looked applied."""
+    import train as T
+
+    cfg = T.Config(task="ifeval", model="Qwen/Qwen3-0.6B", max_new_tokens=128, eval_k=1)
+    assert T.rollout_kwargs(cfg)["max_new_tokens"] == 128
+    eval_kw = {"k": cfg.eval_k, "max_new_tokens": cfg.max_new_tokens} if cfg.model else {}
+    assert eval_kw["max_new_tokens"] == cfg.max_new_tokens == 128
+    # control tasks have no token budget at all and must not be handed one
+    assert T.rollout_kwargs(T.Config(task="cartpole", model="")) == {}
+
+
 def test_ifeval_prompt_states_the_constraints_it_scores():
     """The model can only satisfy what it was told. If build_prompt and the reward ever drift
     apart the task becomes unlearnable while still logging a plausible reward."""

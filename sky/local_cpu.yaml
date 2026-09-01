@@ -1,0 +1,61 @@
+# One CPU training run on the local kind cluster `sky local up` creates.
+# No GPU, so this is the plain HF path (no vLLM). Single node; see sky/local_jobgroup.yaml
+# for the trainer + rollout-worker split.
+#
+#   sky local up
+#   sky launch -c nanorl-cpu sky/local_cpu.yaml            # setup + weight warm-up, once
+#   sky exec nanorl-cpu sky/local_cpu.yaml --env ARGS="--lr 8e-5" --env NAME=lr8
+#   sky down nanorl-cpu
+#
+# Launched once and driven with `sky exec` on purpose: setup installs torch and the first run
+# downloads the weights, and paying that per experiment costs more than the experiments do.
+name: nanorl-cpu
+
+resources:
+  infra: k8s/kind-skypilot   # pinned: bare `k8s` would follow whatever kubeconfig points at
+  cpus: 8+                   # kube-system reserves ~1 of the node's 10, so 9+ never schedules
+  memory: 13+                # 1.7B fp32 is ~10.2 GB resident; KV at gen_batch 16 adds ~1.2
+
+workdir: .
+
+envs:
+  NAME: run
+  SEED: "0"
+  ARGS: ""
+  CONFIG: configs/ifeval_local_cpu.yaml
+  OUT: ""     # default runs/$NAME_s$SEED; set it to direct output elsewhere
+  CMD: ""     # run this python script instead of train.py (eval-only analyses, merging, ...)
+
+setup: |
+  set -euo pipefail
+  # Own the interpreter rather than inheriting one. A bare `uv pip install` needs an active
+  # VIRTUAL_ENV, and a fresh kind pod has none: no `python` on PATH, no ~/sky-user-env, only
+  # ~/skypilot-runtime. Depending on that layout is how this task silently worked on one cluster
+  # and failed setup on the next with "No virtual environment found".
+  export PATH="$HOME/.local/bin:$PATH"
+  command -v uv >/dev/null || "$HOME/skypilot-runtime/bin/python" -m pip install -q uv
+  uv venv "$HOME/nanorl-env" >/dev/null
+  PY="$HOME/nanorl-env/bin/python"
+  # CPU wheel index: plain PyPI torch pulls ~4.5 GB of CUDA runtime this box will never use.
+  uv pip install -q --python "$PY" --index-url https://download.pytorch.org/whl/cpu torch
+  uv pip install -q --python "$PY" transformers "datasets<4" peft numpy pyyaml
+  "$PY" -c "import torch, transformers, peft, datasets; print('env ok', torch.__version__)"
+
+run: |
+  set -euo pipefail
+  # SkyPilot defaults OMP to 1, which is slow enough to matter. Thread count is otherwise a weak
+  # lever here: CPU decode is bandwidth-bound on the weights, so 6/8/10 threads measure the same
+  # and batching (gen_batch / micro_batch) is what actually moves throughput.
+  export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 TOKENIZERS_PARALLELISM=false
+  export HF_HOME=$HOME/.cache/huggingface
+  PY="$HOME/nanorl-env/bin/python"
+  # Two entry points so a harness can drive this task without the task knowing about the
+  # harness: CMD runs an arbitrary script (analysis, merging, benchmarks), otherwise it is a
+  # training job. OUT lets the caller place results wherever it collects them from.
+  if [ -n "${CMD}" ]; then
+    PYTHONPATH=. "$PY" ${CMD}
+  else
+    OUT="${OUT:-runs/${NAME}_s${SEED}}"
+    mkdir -p "$(dirname "${OUT}")"
+    "$PY" train.py --config "${CONFIG}" --seed "${SEED}" --out "${OUT}" ${ARGS}
+  fi

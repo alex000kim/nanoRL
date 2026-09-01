@@ -220,3 +220,5 @@ __marimo__/
 
 # nanoRL run artifacts
 runs/
+
+.DS_Store
