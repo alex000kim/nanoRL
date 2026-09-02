@@ -191,6 +191,37 @@ def gsm8k_reward(prompt, completion, answer) -> float:
         return 0.0
 
 
+_FRAC_RE = re.compile(r"\\[dt]?frac\{([^{}]+)\}\{([^{}]+)\}")
+
+
+def _num_value(s: str) -> Fraction | None:
+    """Parse a plain number, a/b, \\frac{a}{b} or N% into an exact Fraction; None otherwise."""
+    s = s.strip().replace("$", "").replace("\\left", "").replace("\\right", "")
+    s = s.replace("\\!", "").replace("\\,", "").replace(" ", "").replace(",", "").rstrip(".")
+    m = re.fullmatch(r"\\boxed\{(.*)\}", s)      # tolerate a model echoing \boxed{}
+    if m:
+        s = m.group(1)
+    m = _FRAC_RE.fullmatch(s) or re.fullmatch(r"(-?[\d.]+)/(-?[\d.]+)", s)
+    try:
+        if m:
+            return Fraction(m.group(1)) / Fraction(m.group(2))
+        if s.endswith("%"):
+            return Fraction(s[:-1]) / 100
+        return Fraction(s)
+    except (ValueError, ZeroDivisionError):
+        return None
+
+
+def math_reward(prompt, completion, answer) -> float:
+    """1.0 iff <answer> parses to exactly the gold value. Rows are pre-filtered to numeric
+    golds, so Fraction equality is the whole verifier — no CAS."""
+    ans = extract_answer(completion)
+    if ans is None:
+        return 0.0
+    got = _num_value(ans)
+    return 1.0 if got is not None and got == answer["value"] else 0.0
+
+
 class LLMTask:
     """Shared RLVR plumbing: format prompts -> policy.act -> apply reward list.
     Subclasses load `data`/`eval_data`, define `build_prompt`, and pick `reward_fns`."""
@@ -208,6 +239,8 @@ class LLMTask:
     world: int = 1
     debug_samples: int = 0      # print this many real (prompt, completion, reward) triples
 
+    adapt_sample: bool = False  # weight sampling toward prompts whose groups still spread
+
     def _split(self, rows: list, n_eval: int) -> None:
         """First n_eval rows are the eval holdout; the rest is strided disjointly by rank."""
         self.eval_data = rows[:n_eval]
@@ -215,12 +248,33 @@ class LLMTask:
         if not self.data:
             raise ValueError(f"n_examples must exceed the eval split ({n_eval})")
         self._i = 0
+        for j, r in enumerate(self.data):
+            r["_i"] = j
+        # GRESO-lite (arXiv 2506.02177): EMA of each prompt's group-reward spread. A group
+        # that scores uniformly (dead) yields zero advantage — its generation FLOPs bought
+        # nothing — and on a bimodal-difficulty pool most groups are dead (0.92 measured on
+        # DeepScaleR at G=4). Start optimistic so every prompt gets tried.
+        self._prio = [1.0] * len(self.data)
+        import random as _random
+        self._rng = _random.Random(1234 + self.rank)
 
     def sample(self, n: int) -> list[dict]:
-        """The next n training problems, walking the shard as a ring buffer."""
+        """The next n training problems: a ring walk, or (adapt_sample) a draw weighted by
+        each prompt's EMA spread + a floor so hard prompts are revisited as the policy moves."""
+        if self.adapt_sample:
+            w = [p + 0.05 for p in self._prio]
+            idx = self._rng.choices(range(len(self.data)), weights=w, k=n)
+            return [self.data[j] for j in idx]
         out = [self.data[(self._i + k) % len(self.data)] for k in range(n)]
         self._i = (self._i + n) % len(self.data)
         return out
+
+    def _update_prio(self, problem: dict, rewards: list[float]) -> None:
+        if not self.adapt_sample or "_i" not in problem:
+            return
+        spread = float(max(rewards) - min(rewards) > 1e-6)
+        j = problem["_i"]
+        self._prio[j] = 0.7 * self._prio[j] + 0.3 * spread
 
     def prompt_text(self, policy, p) -> str:
         return policy.format_prompt(self.build_prompt(p), self.system_prompt)
@@ -246,6 +300,7 @@ class LLMTask:
                 # terminal reward on the LAST completion token
                 last = int(tr.mask.nonzero()[-1].item())
                 tr.rewards[last] = total
+            self._update_prio(problem, [float(tr.rewards.sum()) for tr in group])
             groups.append(group)
         batch = Batch.from_groups(groups)
         batch.temperature = temperature if temperature > 0 else 1.0
@@ -441,14 +496,44 @@ class GSM8KTask(LLMTask):
                 "<answer> </answer> tags.")
 
 
+class MathTask(LLMTask):
+    """Competition math (DeepScaleR-Preview: AMC/AIME/MATH/Omni-MATH mix). Kept rows have
+    numeric golds so `math_reward` needs no CAS; most of the 40k rows survive the filter.
+    Deliberately harder than GSM8K/Countdown: a ~9B model should start mid-range, leaving
+    headroom in both directions — Countdown starts at ~0.56 for Qwen3.5-9B with a known
+    ceiling near 0.64, too narrow to measure anything against."""
+
+    def __init__(self, split: str = "train", n_examples: int = 2000, seed: int = 0,
+                 n_eval: int = 128, rank: int = 0, world: int = 1):
+        from datasets import load_dataset
+
+        self.rank, self.world = rank, world
+        ds = load_dataset("agentica-org/DeepScaleR-Preview-Dataset", split="train")
+        ds = ds.shuffle(seed=seed)
+        rows = []
+        for ex in ds:
+            v = _num_value(ex["answer"])
+            if v is None:
+                continue
+            rows.append({"problem": ex["problem"], "value": v})
+            if len(rows) >= n_examples:
+                break
+        self._split(rows, n_eval)
+        self.reward_fns = [(math_reward, 1.0), (format_reward, 0.1)]
+
+    def build_prompt(self, p: dict) -> str:
+        return (p["problem"] + "\nReason step by step, then put ONLY the final answer "
+                "inside <answer> </answer> tags.")
+
+
 def make_task(name: str, **kw):
     keep = lambda *names: {k: v for k, v in kw.items() if k in names}  # noqa: E731
     if name == "cartpole":
         return CartPoleTask(**keep("max_steps", "gamma", "rank", "world"))
-    if name == "countdown":
-        return CountdownTask(**keep("n_examples", "seed", "n_eval", "rank", "world"))
-    if name == "ifeval":
-        return IFEvalTask(**keep("n_examples", "seed", "n_eval", "rank", "world"))
-    if name == "gsm8k":
-        return GSM8KTask(**keep("n_examples", "seed", "n_eval", "rank", "world"))
-    raise ValueError(f"unknown task {name!r}")
+    llm = {"countdown": CountdownTask, "ifeval": IFEvalTask,
+           "gsm8k": GSM8KTask, "math": MathTask}.get(name)
+    if llm is None:
+        raise ValueError(f"unknown task {name!r}")
+    task = llm(**keep("n_examples", "seed", "n_eval", "rank", "world"))
+    task.adapt_sample = bool(kw.get("adapt_sample", False))
+    return task
