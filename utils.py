@@ -51,12 +51,18 @@ def all_sum(x: float | torch.Tensor, device=None) -> torch.Tensor:
 
 
 def all_reduce_grads(params) -> None:
-    """SUM every rank's gradients in place (must be SUM, not MEAN: see loss_denoms)."""
+    """SUM every rank's gradients in place (must be SUM, not MEAN: see loss_denoms).
+
+    Every rank must reduce EVERY param: a rank whose whole batch was skipped (all groups
+    dead — routine on hard tasks) has grad None, and skipping its reduces desyncs the
+    NCCL collective sequence across ranks (same SeqNum, different tensors) -> 30-min
+    watchdog -> SIGABRT. A zero tensor is that rank's correct contribution."""
     if not is_dist():
         return
     for p in params:
-        if p.grad is not None:
-            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+        if p.grad is None:
+            p.grad = torch.zeros_like(p)
+        dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
 
 
 def broadcast_params(module) -> None:
