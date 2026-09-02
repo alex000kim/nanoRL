@@ -1,0 +1,43 @@
+# Disaggregated async GRPO on DeepScaleR math: vLLM rollout workers + HF trainer.
+# Both roles read this file; --role picks which half runs.
+#   sky jobs launch sky/math_jobgroup.yaml
+task: math
+algo: grpo
+model: Qwen/Qwen3.5-9B # hybrid GDN: transformers >= 5.2 (trainer), vllm 0.28+cu129 (workers)
+
+# Per WORKER submission, not a global batch (the trainer trains on one submission per step).
+n_prompts: 12
+group_size: 4          # 48 sequences per submitted batch; diversity > group size (measured)
+micro_batch: 4         # scoring: logits-bound at ~2.3k tokens
+gen_batch: 48          # trainer-side eval generation only; workers generate with vLLM
+
+max_staleness: 8      # trainer at ~14s/step advances ~7 versions per 100s worker cycle;
+                       # 4 rejected ~70% of batches (measured 2026-09-02)
+pop_timeout: 2400.0    # > one worker's FULL generation cycle (arrivals are bursty)
+serve_port: 8000
+
+lora: true             # adapter-only weight sync
+lora_r: 32
+grad_ckpt: true
+dtype: bfloat16
+device: cuda
+
+steps: 100             # workers exit when the version reaches this
+inner_epochs: 2        # soak trainer idle time, halve version churn, activate the clip
+lr: 5.0e-5
+eps: 0.2               # load-bearing once staleness > 0
+kl_coef: 0.0
+length_norm: true
+norm_std: true
+max_new_tokens: 2048   # math CoT; 1024 truncated 37-88% in smoke
+overlong_coef: 1.0     # DAPO soft penalty: teach wrap-up
+temperature: 0.8
+top_p: 1.0
+think: false
+
+seed: 0
+eval_every: 10         # eval runs on the trainer GPU and competes with training
+eval_n: 128
+ckpt_every: 25
+n_examples: 20000
+out: runs/qwen35_9b_math_async

@@ -1,0 +1,39 @@
+# GRPO on Countdown with Qwen3.5-9B (hybrid GDN + full-attention). Sized for 6x H100 sync:
+#   torchrun --nproc_per_node=6 train.py --config configs/countdown_grpo_qwen35.yaml
+# Needs transformers >= 5.2 (GDN arch) and vLLM >= 0.17 for the async path.
+task: countdown
+algo: grpo
+model: Qwen/Qwen3.5-9B
+
+n_prompts: 48          # GLOBAL batch: 8 per rank x 8 completions = 384 sequences/step
+group_size: 8
+micro_batch: 8         # ~151k vocab (vs Gemma's 262k); 8 fit H100-80GB for Qwen3-8B
+gen_batch: 24
+
+lora: true
+lora_r: 32
+# default q/k/v/o only exists in the ~25% full-attention layers; GDN layers use
+# in_proj_qkvz/in_proj_ba/out_proj (unadapted for now — candidate experiment)
+grad_ckpt: true
+dtype: bfloat16
+device: cuda
+
+steps: 100
+inner_epochs: 1
+lr: 5.0e-5
+eps: 0.2
+kl_coef: 0.0
+length_norm: true
+norm_std: true
+max_new_tokens: 512
+temperature: 0.8
+top_p: 1.0
+think: false           # thinking template multiplies rollout cost
+
+seed: 0
+eval_every: 10
+eval_n: 128
+ckpt_every: 25
+n_examples: 20000
+debug_samples: 2
+out: runs/qwen35_9b_countdown

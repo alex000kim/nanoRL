@@ -1,54 +1,54 @@
-# Disaggregated async RL as a SkyPilot Job Group: an 8-rank trainer + 8 vLLM rollout
-# workers, discovering each other by hostname ({task}-{idx}.{group}).
-#   sky jobs launch sky/jobgroup.yaml
+# Async math RL: 1-GPU HF trainer + 4 single-GPU vLLM rollout workers (this cluster is
+# H100-only; requestable per-node quantities are 1/2/4/8).
+#   sky jobs launch sky/math_jobgroup.yaml
 #   sky jobs logs <id> trainer      # or: rollout
-# Trainer ranks and workers move together: each rank consumes one worker submission per
-# step, so 8 ranks need ~8 workers. NANORL_TOKEN gates the trainer's HTTP endpoint.
 ---
-name: nanorl
+name: nanorl-math
 execution: parallel
 
 ---
 name: trainer
 resources:
   infra: k8s
-  # Pinned, not a candidate list: heterogeneous placement must be asserted.
-  accelerators: H100:8
-  cpus: 16+
-  memory: 128+
+  accelerators: H100:1
+  cpus: 4+               # the last free GPU sits next to ~6 free vCPUs; the trainer is
+  memory: 32+            # GPU-bound anyway
 envs:
-  CFG: configs/countdown_async_vllm.yaml
+  CFG: configs/math_async_vllm.yaml
   NANORL_TOKEN: nanorl-e2e
 workdir: .
 setup: |
   command -v uv >/dev/null || pip install -q uv
-  # pod driver is CUDA 12.8 (12080); default torch wheel is now cu130 and fails _cuda_init.
-  # --reinstall: a cu130 torch already on the pod satisfies "torch" and would be kept.
+  # driver is CUDA 12.8: cu128 torch (see nebius gotcha #5); --reinstall beats a cached cu130
   uv pip install -q --system --reinstall torch --index-url https://download.pytorch.org/whl/cu128
   uv pip install -q --system "transformers>=5.2" "datasets<4" peft numpy pyyaml
+  uv pip install -q --system flash-linear-attention "triton>=3.7.1" || true
   python -c "import torch; assert torch.version.cuda.startswith('12.'), torch.version.cuda"
 run: |
   export HF_HOME=$HOME/.cache/huggingface
   export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-  # micro-batch 8 fits H100 80GB at 512-token completions (16 OOMs); config's 4 is for 48GB
-  torchrun --nproc_per_node=$SKYPILOT_NUM_GPUS_PER_NODE train.py \
-    --config $CFG --role trainer --serve-port 8000 --micro-batch 8
+  python train.py --config $CFG --role trainer --serve-port 8000
 ---
 name: rollout
-num_nodes: 8                   # ~one worker per trainer rank
+num_nodes: 3           # 1 trainer + 3 workers = the 4 H100s currently free
 resources:
   infra: k8s
-  accelerators: L40S:1
+  accelerators: H100:1
   cpus: 8+
   memory: 60+
 envs:
-  CFG: configs/countdown_async_vllm.yaml
+  CFG: configs/math_async_vllm.yaml
   NANORL_TOKEN: nanorl-e2e
 workdir: .
 setup: |
   command -v uv >/dev/null || pip install -q uv
-  # vllm >= 0.17 for Qwen3.5's hybrid GDN layers
-  uv pip install -q --system torch "transformers>=5.2" "datasets<4" peft numpy pyyaml "vllm>=0.17"
+  # PyPI vllm is cu130-only (driver is 12.8). GitHub releases ship +cu129 wheels; 12.9
+  # runtime on a 12.8 driver is fine via CUDA minor-version compat. torch from cu129 index.
+  uv pip install -q --system --reinstall \
+    "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.28.0/vllm-0.28.0+cu129-cp38-abi3-manylinux_2_28_x86_64.whl" \
+    --extra-index-url https://download.pytorch.org/whl/cu129 \
+    --index-strategy unsafe-best-match
+  uv pip install -q --system "transformers>=5.2" "datasets<4" peft numpy pyyaml
   # py3.10: flashinfer's `array.array[int]` annotation breaks at import; make it lazy.
   SP=$(python -c "import sysconfig;print(sysconfig.get_paths()['purelib'])")
   F="$SP/flashinfer/comm/fd_exchange.py"
@@ -61,5 +61,5 @@ run: |
   export VLLM_WORKER_MULTIPROC_METHOD=spawn   # no fork after CUDA init
   export VLLM_USE_FLASHINFER_SAMPLER=0        # image has no nvcc for the JIT sampler
   python train.py --config $CFG --role rollout --vllm \
-    --vllm-gpu-frac 0.85 --vllm-max-len 2048 \
-    --trainer-url http://trainer-0.nanorl:8000
+    --vllm-gpu-frac 0.85 --vllm-max-len 4096 \
+    --trainer-url http://trainer-0.nanorl-math:8000

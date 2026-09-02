@@ -1,24 +1,29 @@
-# GRPO on Countdown with Qwen2.5-0.5B. Any single 24-40GB GPU, a few hours.
+# GRPO on Countdown with Qwen3.5-9B (LoRA). One 80GB GPU, a few hours.
+# Smaller GPU? Drop to Qwen/Qwen3.5-4B (fits 40GB at these settings, micro_batch 2 on 24GB).
 task: countdown
 algo: grpo
-model: Qwen/Qwen2.5-0.5B-Instruct
-steps: 500
+model: Qwen/Qwen3.5-9B      # hybrid GDN arch: needs transformers >= 5.2
+steps: 200
 n_prompts: 32          # questions per step
 group_size: 8          # completions per question; must be >= 2
 inner_epochs: 1
-lr: 1.0e-6
+lr: 5.0e-5             # LoRA lr; full-FT wants ~1e-6
 eps: 0.2
 kl_coef: 0.0           # no reference model
 length_norm: true      # false = Dr.GRPO aggregator
 norm_std: true         # false = Dr.GRPO advantage
 max_new_tokens: 512
-temperature: 0.8       # 1.0 makes a 0.5B model garble the answer tags
+temperature: 0.8
 top_p: 1.0             # <1 is not modeled in the ratio; use temperature instead
-micro_batch: 4         # sequences per fwd+bwd chunk; lower to 2 on 24GB
-dtype: bfloat16        # compute dtype; master weights stay fp32
+lora: true             # full FT of 9B does not fit one GPU
+lora_r: 32
+grad_ckpt: true
+micro_batch: 8         # sequences per fwd+bwd chunk (logits-bound); 4 on 40GB
+gen_batch: 24          # generation is KV-bound; tying it to micro_batch is 6x slower
+dtype: bfloat16        # compute dtype; adapter master weights stay fp32
 device: cuda
 eval_every: 20
 eval_n: 128
-ckpt_every: 100
+ckpt_every: 50
 n_examples: 50000
 out: runs/countdown_grpo

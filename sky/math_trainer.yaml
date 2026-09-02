@@ -1,0 +1,22 @@
+# Async math trainer, single node (multi-node submission is broken on this API server —
+# see nebius gotcha #6; the disaggregated topology runs as 1+N single-node clusters).
+#   sky launch -c mathtrainer sky/math_trainer.yaml -y -d
+resources:
+  infra: k8s
+  accelerators: H100:1
+  cpus: 4+
+  memory: 32+
+envs:
+  CFG: configs/math_async_vllm.yaml
+  NANORL_TOKEN: nanorl-e2e
+workdir: .
+setup: |
+  command -v uv >/dev/null || pip install -q uv
+  uv pip install -q --system --reinstall torch --index-url https://download.pytorch.org/whl/cu128
+  uv pip install -q --system "transformers>=5.2" "datasets<4" peft numpy pyyaml
+  uv pip install -q --system flash-linear-attention "triton>=3.7.1" || true
+  python -c "import torch; assert torch.version.cuda.startswith('12.'), torch.version.cuda"
+run: |
+  export HF_HOME=$HOME/.cache/huggingface
+  export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+  python train.py --config $CFG --role trainer --serve-port 8000

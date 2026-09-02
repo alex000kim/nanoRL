@@ -1,0 +1,39 @@
+# GRPO on competition math (DeepScaleR-Preview, numeric-gold rows) with Qwen3.5-9B.
+# Sized for 4x H100 sync (this cluster's requestable quantities are 1/2/4/8 per node):
+#   torchrun --nproc_per_node=4 train.py --config configs/math_grpo_qwen35.yaml
+task: math
+algo: grpo
+model: Qwen/Qwen3.5-9B      # hybrid GDN arch: transformers >= 5.2
+
+n_prompts: 48          # GLOBAL batch: 12 per rank x 4 completions = 192 sequences/step
+group_size: 4          # prompt diversity > group size at fixed seqs/step (measured)
+micro_batch: 4         # scoring logits are [mb, ~2.3k, 151k] at 2048-token completions
+gen_batch: 48          # decode is bandwidth-bound and hybrid-GDN KV is tiny; 16 measured
+                       # 1070 s/step, batching the whole rank's 48 seqs into one generate
+
+lora: true
+lora_r: 32
+grad_ckpt: true
+dtype: bfloat16
+device: cuda
+
+steps: 100
+inner_epochs: 1
+lr: 5.0e-5
+eps: 0.2
+kl_coef: 0.0
+length_norm: true
+norm_std: true
+max_new_tokens: 2048   # smoke at 1024 truncated 37-88% of math CoT (mean resp_len ~1000)
+overlong_coef: 1.0     # DAPO soft penalty from 1536 tokens: teach wrap-up, don't just cap
+temperature: 0.8
+top_p: 1.0
+think: false
+
+seed: 0
+eval_every: 10
+eval_n: 128
+ckpt_every: 25
+n_examples: 20000
+debug_samples: 2
+out: runs/qwen35_9b_math

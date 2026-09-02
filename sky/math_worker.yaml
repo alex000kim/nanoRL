@@ -1,0 +1,40 @@
+# Async math vLLM rollout worker, single node. Launch one cluster per worker with a
+# distinct WORKER_RANK (train.py shards prompts by SKYPILOT_NODE_RANK, which is 0 on a
+# standalone cluster — identical ranks would sample identical prompts):
+#   sky launch -c mathw1 sky/math_worker.yaml -y -d \
+#     --env TRAINER_URL=http://<trainer-pod-ip>:8000 --env WORKER_RANK=1 --env WORKERS_TOTAL=4
+resources:
+  infra: k8s
+  accelerators: H100:1
+  cpus: 4+
+  memory: 32+
+envs:
+  CFG: configs/math_async_vllm.yaml
+  NANORL_TOKEN: nanorl-e2e
+  TRAINER_URL: ""
+  WORKER_RANK: "1"
+  WORKERS_TOTAL: "4"
+workdir: .
+setup: |
+  command -v uv >/dev/null || pip install -q uv
+  # vllm 0.28+cu129 GitHub wheel (PyPI is cu130-only; driver is 12.8) + torch from cu129 index
+  uv pip install -q --system --reinstall \
+    "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.28.0/vllm-0.28.0+cu129-cp38-abi3-manylinux_2_28_x86_64.whl" \
+    --extra-index-url https://download.pytorch.org/whl/cu129 \
+    --index-strategy unsafe-best-match
+  uv pip install -q --system "transformers>=5.2" "datasets<4" peft numpy pyyaml
+  # py3.10: flashinfer's `array.array[int]` annotation breaks at import; make it lazy.
+  SP=$(python -c "import sysconfig;print(sysconfig.get_paths()['purelib'])")
+  F="$SP/flashinfer/comm/fd_exchange.py"
+  if [ -f "$F" ] && ! head -1 "$F" | grep -q "from __future__"; then
+    sed -i "1i from __future__ import annotations" "$F"
+  fi
+run: |
+  export HF_HOME=$HOME/.cache/huggingface
+  export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+  export VLLM_WORKER_MULTIPROC_METHOD=spawn   # no fork after CUDA init
+  export VLLM_USE_FLASHINFER_SAMPLER=0        # image has no nvcc for the JIT sampler
+  export SKYPILOT_NODE_RANK=$WORKER_RANK SKYPILOT_NUM_NODES=$WORKERS_TOTAL
+  python train.py --config $CFG --role rollout --vllm \
+    --vllm-gpu-frac 0.85 --vllm-max-len 4096 \
+    --trainer-url $TRAINER_URL

@@ -1,0 +1,34 @@
+# Smoke test: does Qwen3.5-9B (hybrid GDN) load + generate + LoRA-train in this repo's
+# HF path on the cluster image? 1x H100, a few tiny steps, ~15 min.
+#   sky launch -c smoke sky/smoke_qwen35.yaml -y -d
+resources:
+  infra: k8s
+  accelerators: H100:1
+  cpus: 16+
+  memory: 128+
+envs:
+  CFG: configs/countdown_grpo_qwen35.yaml
+workdir: .
+setup: |
+  command -v uv >/dev/null || pip install -q uv
+  # pod driver is CUDA 12.8 (12080); default torch wheel is now cu130 and fails _cuda_init.
+  # --reinstall: a cu130 torch already on the pod satisfies "torch" and would be kept.
+  uv pip install -q --system --reinstall torch --index-url https://download.pytorch.org/whl/cu128
+  uv pip install -q --system "transformers>=5.2" "datasets<4" peft numpy pyyaml
+  python -c "import torch; assert torch.version.cuda.startswith('12.'), torch.version.cuda"
+run: |
+  export HF_HOME=$HOME/.cache/huggingface
+  export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+  python - <<'EOF'
+  # preflight: arch + module names, before burning time on a full train step
+  from transformers import AutoConfig
+  import transformers, torch
+  print("transformers", transformers.__version__, "torch", torch.__version__)
+  c = AutoConfig.from_pretrained("Qwen/Qwen3.5-9B")
+  print("model_type:", c.model_type, "| layers:", getattr(c, "num_hidden_layers", "?"),
+        "| vocab:", getattr(c, "vocab_size", "?"))
+  print("layer_types:", getattr(c, "layer_types", "n/a")[:8], "...")
+  EOF
+  python train.py --config $CFG \
+    --steps 4 --n-prompts 4 --group-size 4 --micro-batch 4 --gen-batch 16 \
+    --eval-every 2 --eval-n 16 --ckpt-every 0 --out runs/smoke_qwen35

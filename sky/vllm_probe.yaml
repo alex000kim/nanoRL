@@ -1,0 +1,33 @@
+# Probe: load Qwen3.5-9B (hybrid GDN) in vLLM with LoRA on this image. Gates the async
+# rollout path and the spec-decode experiment.
+#   sky exec smoke sky/vllm_probe.yaml
+# PyPI's vllm wheel is cu130-only (needs a CUDA-13 driver; pod driver is 12.8). GitHub
+# releases ship +cu129 variants, and 12.9-on-12.8 works via CUDA minor-version compat.
+# torch comes from the matching cu129 index (2.13.0+cu129 is its newest).
+resources:
+  accelerators: H100:1   # sky exec without resources gets ZERO GPUs (CUDA masked entirely)
+envs: {}
+workdir: .
+run: |
+  export HF_HOME=$HOME/.cache/huggingface
+  export VLLM_WORKER_MULTIPROC_METHOD=spawn
+  export VLLM_USE_FLASHINFER_SAMPLER=0
+  ok=""
+  for V in 0.28.0 0.27.1 0.26.0; do
+    echo "=== trying vllm $V+cu129"
+    if uv pip install -q --system --reinstall \
+        "vllm @ https://github.com/vllm-project/vllm/releases/download/v${V}/vllm-${V}+cu129-cp38-abi3-manylinux_2_28_x86_64.whl" \
+        --extra-index-url https://download.pytorch.org/whl/cu129 \
+        --index-strategy unsafe-best-match \
+       && python -c "import vllm, torch; print('import ok:', vllm.__version__, torch.__version__, torch.version.cuda)"; then
+      ok=$V; break
+    fi
+  done
+  [ -n "$ok" ] || { echo "NO_VLLM_CANDIDATE_INSTALLED"; exit 1; }
+  # py3.10 flashinfer annotation fix (no-op if already patched or absent)
+  SP=$(python -c "import sysconfig;print(sysconfig.get_paths()['purelib'])")
+  F="$SP/flashinfer/comm/fd_exchange.py"
+  if [ -f "$F" ] && ! head -1 "$F" | grep -q "from __future__"; then
+    sed -i "1i from __future__ import annotations" "$F"
+  fi
+  python sky/vllm_probe.py

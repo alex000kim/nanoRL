@@ -3,8 +3,9 @@
 #   sky jobs launch sky/jobgroup.yaml
 task: countdown
 algo: grpo
-# Gemma-4 cannot be used with --vllm (per-layer heterogeneous attention); Qwen3-8B loads fine.
-model: Qwen/Qwen3-8B
+# Gemma-4 cannot be used with --vllm (per-layer heterogeneous attention). Qwen3.5's hybrid
+# GDN arch needs vLLM >= 0.17; LoRA only attaches to the ~25% full-attention layers there.
+model: Qwen/Qwen3.5-9B
 
 # Per WORKER submission, not a global batch: the trainer trains on one submission per step,
 # so more workers raise batch frequency, not size. Small frequent batches keep staleness low.
@@ -44,4 +45,4 @@ eval_every: 20         # eval runs on the trainer GPU and competes with training
 eval_n: 64
 ckpt_every: 0
 n_examples: 20000
-out: runs/qwen3_async_8xh100
+out: runs/qwen35_9b_async

@@ -1,0 +1,28 @@
+# Qwen3.5-9B GRPO baseline on DeepScaleR math, 4x H100 sync (max requestable per node
+# here is 4 short of a full 8). Arms override CFG/ARGS:
+#   sky launch -c mathbase sky/math_baseline.yaml -y -d
+#   sky launch -c arm1 sky/math_baseline.yaml -y -d --env ARGS="--lora-targets gate_proj,up_proj,down_proj --out runs/arm_mlp"
+resources:
+  infra: k8s
+  accelerators: H100:4
+  cpus: 32+
+  memory: 256+
+envs:
+  CFG: configs/math_grpo_qwen35.yaml
+  ARGS: ""
+workdir: .
+setup: |
+  command -v uv >/dev/null || pip install -q uv
+  # pod driver is CUDA 12.8 (12080); default torch wheel is now cu130 and fails _cuda_init.
+  # --reinstall: a cu130 torch already on the pod satisfies "torch" and would be kept.
+  uv pip install -q --system --reinstall torch --index-url https://download.pytorch.org/whl/cu128
+  uv pip install -q --system "transformers>=5.2" "datasets<4" peft numpy pyyaml
+  # Triton GDN kernels (no nvcc needed); without them transformers decodes Qwen3.5's
+  # linear-attention layers on a slow pure-torch path. fla's Hopper backward refuses
+  # Triton 3.4-3.7.0 (fla #640 correctness bug) -> pull in a fixed Triton explicitly.
+  uv pip install -q --system flash-linear-attention "triton>=3.7.1" || true
+  python -c "import torch; assert torch.version.cuda.startswith('12.'), torch.version.cuda"
+run: |
+  export HF_HOME=$HOME/.cache/huggingface
+  export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+  torchrun --nproc_per_node=$SKYPILOT_NUM_GPUS_PER_NODE train.py --config $CFG $ARGS
