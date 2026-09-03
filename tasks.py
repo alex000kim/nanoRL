@@ -242,10 +242,18 @@ class LLMTask:
     adapt_sample: bool = False  # weight sampling toward prompts whose groups still spread
     overlong_filter: bool = False  # DAPO-style: no gradient through truncated sequences
 
-    def _split(self, rows: list, n_eval: int) -> None:
-        """First n_eval rows are the eval holdout; the rest is strided disjointly by rank."""
+    def _split(self, rows: list, n_eval: int, seed: int = 0) -> None:
+        """First n_eval rows are the eval holdout; the rest is strided disjointly by rank.
+
+        Callers pass rows in a FIXED-seed order so every training seed evaluates on the
+        SAME problems (seed-varying holdouts made cross-seed comparisons meaningless —
+        measured baselines ranged 0.453-0.578 across seeds on "the" eval set). Only the
+        train remainder is reshuffled by the training seed."""
+        import random as _random
         self.eval_data = rows[:n_eval]
-        self.data = rows[n_eval:][self.rank :: self.world]
+        rest = rows[n_eval:]
+        _random.Random(seed).shuffle(rest)
+        self.data = rest[self.rank :: self.world]
         if not self.data:
             raise ValueError(f"n_examples must exceed the eval split ({n_eval})")
         self._i = 0
@@ -432,7 +440,7 @@ class IFEvalTask(LLMTask):
 
         self.rank, self.world = rank, world
         ds = load_dataset("allenai/RLVR-IFeval", split="train")
-        rng = random.Random(seed)
+        rng = random.Random(1234)  # pool, constraints and eval holdout fixed across seeds
         rows, seen = [], set()
         for ex in ds:
             # Strip the row's own constraint so only OUR constraints are asked for and scored.
@@ -459,7 +467,7 @@ class IFEvalTask(LLMTask):
         # rollout workers derive identical prompts without sending any of this over the wire.
         data = [{"stem": s, "cids": sorted(rng.sample(range(len(IFEVAL_CONSTRAINTS)),
                                                       IFEVAL_K))} for s in rows]
-        self._split(data, n_eval)
+        self._split(data, n_eval, seed)
         self.reward_fns = [(ifeval_reward, 1.0)]
 
     def build_prompt(self, p: dict) -> str:
@@ -474,8 +482,9 @@ class CountdownTask(LLMTask):
 
         self.rank, self.world = rank, world
         ds = load_dataset("Jiayi-Pan/Countdown-Tasks-3to4", split="train")
-        ds = ds.shuffle(seed=seed).select(range(min(n_examples, len(ds))))
-        self._split([{"nums": list(ex["nums"]), "target": int(ex["target"])} for ex in ds], n_eval)
+        ds = ds.shuffle(seed=1234).select(range(min(n_examples, len(ds))))  # pool+eval fixed
+        self._split([{"nums": list(ex["nums"]), "target": int(ex["target"])} for ex in ds],
+                    n_eval, seed)
         self.reward_fns = [(countdown_reward, 1.0), (format_reward, 0.1)]
 
     def build_prompt(self, p: dict) -> str:
@@ -491,12 +500,12 @@ class GSM8KTask(LLMTask):
 
         self.rank, self.world = rank, world
         ds = load_dataset("openai/gsm8k", "main", split=split)
-        ds = ds.shuffle(seed=seed).select(range(min(n_examples, len(ds))))
+        ds = ds.shuffle(seed=1234).select(range(min(n_examples, len(ds))))  # pool+eval fixed
         rows = []
         for ex in ds:
             gold = ex["answer"].split("####")[-1].strip().replace(",", "")
             rows.append({"question": ex["question"], "value": float(gold)})
-        self._split(rows, n_eval)
+        self._split(rows, n_eval, seed)
         self.reward_fns = [(gsm8k_reward, 1.0), (format_reward, 0.1)]
 
     def build_prompt(self, p: dict) -> str:
@@ -517,7 +526,7 @@ class MathTask(LLMTask):
 
         self.rank, self.world = rank, world
         ds = load_dataset("agentica-org/DeepScaleR-Preview-Dataset", split="train")
-        ds = ds.shuffle(seed=seed)
+        ds = ds.shuffle(seed=1234)  # pool+eval fixed across training seeds
         rows = []
         for ex in ds:
             v = _num_value(ex["answer"])
@@ -526,7 +535,7 @@ class MathTask(LLMTask):
             rows.append({"problem": ex["problem"], "value": v})
             if len(rows) >= n_examples:
                 break
-        self._split(rows, n_eval)
+        self._split(rows, n_eval, seed)
         self.reward_fns = [(math_reward, 1.0), (format_reward, 0.1)]
 
     def build_prompt(self, p: dict) -> str:
