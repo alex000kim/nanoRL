@@ -22,8 +22,9 @@ device: cuda
 
 steps: 100
 inner_epochs: 1
-lr: 1.5e-4             # 2x2 sweep 2026-09-02: beats 5e-5 on mean/late-window at both
-                       # LoRA target sets; 5e-5 (inherited from Countdown) was undertuned
+lr: 5.0e-5             # 1.5e-4 trains faster on seed 0 but LENGTH-COLLAPSED on seed 1
+                       # (resp_len 1300->10, answer-only guessing, eval 0.55->0.19 by step
+                       # 10). 5e-5 is stable across 4 runs; 8e-5 under test.
 eps: 0.2
 kl_coef: 0.0
 length_norm: true
