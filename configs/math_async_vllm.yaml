@@ -30,7 +30,8 @@ kl_coef: 0.0
 length_norm: true
 norm_std: true
 max_new_tokens: 2048   # math CoT; 1024 truncated 37-88% in smoke
-overlong_coef: 1.0     # DAPO soft penalty: teach wrap-up
+overlong_coef: 0.0
+overlong_filter: true  # the soft penalty baits length collapse (see math_grpo_qwen35.yaml)
 temperature: 0.8
 top_p: 1.0
 think: false
