@@ -240,6 +240,7 @@ class LLMTask:
     debug_samples: int = 0      # print this many real (prompt, completion, reward) triples
 
     adapt_sample: bool = False  # weight sampling toward prompts whose groups still spread
+    overlong_filter: bool = False  # DAPO-style: no gradient through truncated sequences
 
     def _split(self, rows: list, n_eval: int) -> None:
         """First n_eval rows are the eval holdout; the rest is strided disjointly by rank."""
@@ -300,6 +301,13 @@ class LLMTask:
                 # terminal reward on the LAST completion token
                 last = int(tr.mask.nonzero()[-1].item())
                 tr.rewards[last] = total
+                # DAPO's overlong FILTERING (not the soft penalty): a truncated sequence
+                # contributes no gradient. The penalty variant makes short outputs strictly
+                # safe and turns a high-lr transient into terminal length collapse
+                # (measured: resp_len 1300->10, eval 0.55->0.18); with mask zeroed the seq
+                # reads as reward 0 in the group baseline — closer to truth than -1.
+                if self.overlong_filter and tr.truncated:
+                    tr.mask.zero_()
             self._update_prio(problem, [float(tr.rewards.sum()) for tr in group])
             groups.append(group)
         batch = Batch.from_groups(groups)
@@ -536,4 +544,5 @@ def make_task(name: str, **kw):
         raise ValueError(f"unknown task {name!r}")
     task = llm(**keep("n_examples", "seed", "n_eval", "rank", "world"))
     task.adapt_sample = bool(kw.get("adapt_sample", False))
+    task.overlong_filter = bool(kw.get("overlong_filter", False))
     return task
