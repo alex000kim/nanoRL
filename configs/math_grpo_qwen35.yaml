@@ -24,9 +24,10 @@ device: cuda
 
 steps: 100
 inner_epochs: 1
-lr: 5.0e-5             # 1.5e-4 trains faster on seed 0 but LENGTH-COLLAPSED on seed 1
-                       # (resp_len 1300->10, answer-only guessing, eval 0.55->0.19 by step
-                       # 10). 5e-5 is stable across 4 runs; 8e-5 under test.
+lr: 8.0e-5             # with overlong_filter: same 0.727 peak as 5e-5 but ~30% fewer
+                       # steps (100 vs 140), stable through 150. Higher lrs need the
+                       # filter: the PENALTY variant length-collapsed at >=8e-5 (1.5e-4
+                       # collapsed seed 1 by step 10: resp_len 1300->10, eval 0.55->0.19).
 eps: 0.2
 kl_coef: 0.0
 length_norm: true
