@@ -30,7 +30,12 @@ kl_coef: 0.0
 length_norm: true
 norm_std: true
 max_new_tokens: 2048   # smoke at 1024 truncated 37-88% of math CoT (mean resp_len ~1000)
-overlong_coef: 1.0     # DAPO soft penalty from 1536 tokens: teach wrap-up, don't just cap
+# The soft overlong PENALTY (overlong_coef) makes short outputs strictly safe and turns a
+# high-lr transient into terminal length collapse (measured: resp_len 1300->10 within 10-90
+# steps depending on lr). FILTERING (no gradient through truncated seqs) ran 150 steps with
+# no collapse at both 5e-5 and 8e-5, peak 0.688.
+overlong_coef: 0.0
+overlong_filter: true
 temperature: 0.8
 top_p: 1.0
 think: false
