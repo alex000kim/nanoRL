@@ -13,9 +13,11 @@ gen_batch: 48          # decode is bandwidth-bound and hybrid-GDN KV is tiny; 16
 
 lora: true
 lora_r: 32
-# gate_proj,up_proj,down_proj learns FASTER early-mid (+6pp steps 10-50) but converges to
-# the same ~0.63-0.66 plateau and finished slightly lower late-window at this lr; default
-# stays attention targets. GDN layers (75% of the model) are unadapted either way.
+# MLP targets exist in EVERY layer (attention q/k/v/o only in the ~25% non-GDN layers).
+# With the filtered reward this run beat attention targets outright: 0.727 peak / ~0.69
+# late vs 0.688 / ~0.65, plus consistent early acceleration across 3 runs (seed-1
+# replicate pending). GDN-internal projections stay unadapted (vLLM LoRA compat).
+lora_targets: gate_proj,up_proj,down_proj
 grad_ckpt: true
 dtype: bfloat16
 device: cuda
