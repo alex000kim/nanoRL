@@ -31,7 +31,11 @@ length_norm: true
 norm_std: true
 max_new_tokens: 2048   # math CoT; 1024 truncated 37-88% in smoke
 overlong_coef: 0.0
-overlong_filter: true  # the soft penalty baits length collapse (see math_grpo_qwen35.yaml)
+overlong_filter: true
+format_gate: true      # no format credit for <200-char completions: kills the short-guess
+                       # attractor at the source. On the ordering that collapsed unprotected
+                       # (0.15) and capped KL-anchored (0.50), gated reached 0.570 = the
+                       # friendly-ordering recipe number. Free, unlike kl_coef.  # the soft penalty baits length collapse (see math_grpo_qwen35.yaml)
 temperature: 0.8
 top_p: 1.0
 think: false

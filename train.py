@@ -62,6 +62,7 @@ class Config:
                                     # rollout FLOPs go to prompts that still produce gradient
     overlong_filter: bool = False   # DAPO overlong filtering: truncated seqs get no gradient
                                     # (use INSTEAD of overlong_coef, which baits length collapse)
+    format_gate: bool = False       # no format credit for ultra-short completions
     # LLM knobs
     max_new_tokens: int = 256
     temperature: float = 1.0
@@ -502,7 +503,8 @@ def rollout_worker(cfg: Config):
     # n_eval must match the trainer's, or workers train on its held-out problems
     task = make_task(cfg.task, n_examples=cfg.n_examples, seed=cfg.seed, gamma=cfg.gamma,
                      n_eval=cfg.eval_n, rank=wid, world=wtot,
-                     adapt_sample=cfg.adapt_sample, overlong_filter=cfg.overlong_filter)
+                     adapt_sample=cfg.adapt_sample, overlong_filter=cfg.overlong_filter,
+                     format_gate=cfg.format_gate)
     if cfg.vllm:
         from model import VLLMGenerator
         policy = VLLMGenerator(cfg.model, dtype=cfg.dtype, lora_r=cfg.lora_r,
@@ -589,7 +591,8 @@ def train(cfg: Config):
 
     task = make_task(cfg.task, n_examples=cfg.n_examples, seed=cfg.seed, gamma=cfg.gamma,
                      n_eval=cfg.eval_n, rank=rank, world=world,
-                     adapt_sample=cfg.adapt_sample, overlong_filter=cfg.overlong_filter)
+                     adapt_sample=cfg.adapt_sample, overlong_filter=cfg.overlong_filter,
+                     format_gate=cfg.format_gate)
     if cfg.debug_samples and is_main():
         task.debug_samples = cfg.debug_samples
     policy = make_policy(cfg, task)

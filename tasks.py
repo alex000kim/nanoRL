@@ -111,6 +111,14 @@ def format_reward(prompt, completion, answer) -> float:
     return 0.5 if "<answer>" in completion else 0.0
 
 
+def gated_format_reward(prompt, completion, answer) -> float:
+    """format_reward, but zero for ultra-short completions (~<50 tokens). The unconditional
+    0.1 credit makes answer-only guessing profitable relative to finished-wrong reasoning,
+    which is the length-collapse attractor's fuel; gating removes the subsidy without
+    touching honest attempts."""
+    return format_reward(prompt, completion, answer) if len(completion) >= 200 else 0.0
+
+
 def think_format_reward(prompt, completion, answer) -> float:
     """Full <think>...</think><answer>...</answer> shape. Not used by default: small models
     never emit it cold, which zeroes every gradient. Useful as a second-stage reward."""
@@ -241,6 +249,7 @@ class LLMTask:
 
     adapt_sample: bool = False  # weight sampling toward prompts whose groups still spread
     overlong_filter: bool = False  # DAPO-style: no gradient through truncated sequences
+    format_gate: bool = False      # format credit only for non-trivial-length completions
 
     def _split(self, rows: list, n_eval: int, seed: int = 0) -> None:
         """First n_eval rows are the eval holdout; the rest is strided disjointly by rank.
@@ -554,4 +563,7 @@ def make_task(name: str, **kw):
     task = llm(**keep("n_examples", "seed", "n_eval", "rank", "world"))
     task.adapt_sample = bool(kw.get("adapt_sample", False))
     task.overlong_filter = bool(kw.get("overlong_filter", False))
+    if kw.get("format_gate"):
+        task.reward_fns = [(fn if fn is not format_reward else gated_format_reward, w)
+                           for fn, w in task.reward_fns]
     return task
