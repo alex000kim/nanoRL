@@ -50,6 +50,7 @@ class Config:
     eps_high: float = 0.0           # DAPO clip-higher: raise ONLY the upper bound (try 0.28)
                                     # so low-probability tokens can still grow; 0 -> use eps
     dual_clip: float = 0.0          # cap the A<0 surrogate at dual_clip*A (try 3.0); 0 -> off
+    warmup_steps: int = 0           # linear lr warmup over N steps; 0 -> constant lr
     skip_zero_adv: bool = True      # skip micro-batches with zero advantage (exact, see
                                     # optimize) — a whole group that scored uniformly
     kl_coef: float = 0.0            # >0 turns on a frozen reference model
@@ -624,6 +625,13 @@ def train(cfg: Config):
     source.publish(policy)                   # v1 must exist before any worker asks
 
     for step in range(start, cfg.steps):
+        if cfg.warmup_steps:
+            # linear lr warmup: the measured early transients (eval 0.53 -> 0.14 after
+            # one update; seed-dependent dips) are the classic no-warmup signature —
+            # the first batches hit a cold adapter at full lr
+            scale = min(1.0, (step + 1) / cfg.warmup_steps)
+            for g in opt.param_groups:
+                g["lr"] = cfg.lr * scale
         # 1 — rollout (no grad)
         batch, staleness = source.next_batch(policy)
         batch = batch.to(cfg.device)

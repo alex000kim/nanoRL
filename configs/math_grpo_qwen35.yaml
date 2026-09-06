@@ -47,6 +47,10 @@ format_gate: true      # no format credit for <200-char completions: kills the s
                        # attractor at the source. On the ordering that collapsed unprotected
                        # (0.15) and capped KL-anchored (0.50), gated reached 0.570 = the
                        # friendly-ordering recipe number. Free, unlike kl_coef.
+warmup_steps: 15       # linear lr warmup. On the collapse cell (no format gate, 2048,
+                       # 8e-5 seed 0) warmup ALONE held 0.53-0.555 through 150 steps where
+                       # unprotected opened at 0.14 and died at 0.15 — near format_gate's
+                       # 0.570 but reward-agnostic, so it generalizes across tasks. Free.
 temperature: 0.8
 top_p: 1.0
 think: false
