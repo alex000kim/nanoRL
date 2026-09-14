@@ -222,3 +222,4 @@ __marimo__/
 runs/
 
 .DS_Store
+ckpts/

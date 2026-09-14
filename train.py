@@ -50,6 +50,9 @@ class Config:
     eps_high: float = 0.0           # DAPO clip-higher: raise ONLY the upper bound (try 0.28)
                                     # so low-probability tokens can still grow; 0 -> use eps
     dual_clip: float = 0.0          # cap the A<0 surrogate at dual_clip*A (try 3.0); 0 -> off
+    loss_mode: str = "clip"         # "clip" (PPO min-clip) | "m2po" (second-moment trust
+                                    # region: mask outlier tokens until M2 <= 0.04; kept
+                                    # async stable at staleness ~39 where clip starved)
     warmup_steps: int = 0           # linear lr warmup over N steps; 0 -> constant lr
     skip_zero_adv: bool = True      # skip micro-batches with zero advantage (exact, see
                                     # optimize) — a whole group that scored uniformly
@@ -223,11 +226,35 @@ def rl_loss(policy, batch, adv, cfg, ref=None, denoms=None):
     ratio = torch.exp(logp - batch.old_logp)             # 1 on the first epoch
     hi = cfg.eps_high or cfg.eps                         # DAPO clip-higher when set
     clipped = torch.clamp(ratio, 1 - cfg.eps, 1 + hi)
-    surr = torch.min(ratio * adv, clipped * adv)
-    if cfg.dual_clip:
-        # For A<0 the UNCLIPPED branch is the min, and it runs to -inf as the ratio grows:
-        # one stale token can own the whole step. Floor that branch at dual_clip*A.
-        surr = torch.where(adv < 0, torch.max(surr, cfg.dual_clip * adv), surr)
+    if cfg.loss_mode == "m2po":
+        # M2PO (2510.01161): keep the plain IS surrogate but MASK the highest-(log r)^2
+        # tokens (only those moving in the trusted direction: A>0&r>1 or A<0&r<1) until the
+        # batch mean of (log r)^2 <= tau=0.04. One knob, stable at staleness >=256 in the
+        # paper. Computed per micro-batch here (noisier than a full-batch M2; documented).
+        tau = 0.04
+        logr = (logp - batch.old_logp).detach()
+        m2 = logr.pow(2) * batch.mask
+        eligible = (((adv > 0) & (logr > 0)) | ((adv < 0) & (logr < 0))) & batch.mask.bool()
+        keep = torch.ones_like(m2)
+        n = batch.mask.sum()
+        if n > 0 and (m2.sum() / n) > tau:
+            flat = torch.where(eligible, m2, torch.zeros_like(m2)).flatten()
+            vals, idx = flat.sort(descending=True)
+            cum = vals.cumsum(0)
+            total = m2.sum()
+            # smallest k with (total - cum[k-1]) / (n - k) <= tau
+            k_range = torch.arange(1, len(vals) + 1, device=vals.device)
+            ok = (total - cum) / (n - k_range).clamp_min(1.0) <= tau
+            k = int(ok.float().argmax().item()) + 1 if ok.any() else int(eligible.sum())
+            drop = idx[:k]
+            keep = keep.flatten().index_fill(0, drop, 0.0).view_as(m2)
+        surr = ratio * adv * keep
+    else:
+        surr = torch.min(ratio * adv, clipped * adv)
+        if cfg.dual_clip:
+            # For A<0 the UNCLIPPED branch is the min, and it runs to -inf as the ratio
+            # grows: one stale token can own the whole step. Floor it at dual_clip*A.
+            surr = torch.where(adv < 0, torch.max(surr, cfg.dual_clip * adv), surr)
     if cfg.tis_clip and batch.sample_logp is not None:
         # old_logp is what the sampling WEIGHTS say under the trainer's kernels; sample_logp is
         # what the engine that actually drew the tokens said. Recomputing fixes the ratio's
@@ -326,6 +353,8 @@ def optimize(policy, opt, batch, adv, cfg, ref=None):
 
 def validate(cfg: Config) -> None:
     """Catch impossible combinations up front, with a message that names the fix."""
+    if cfg.loss_mode not in ("clip", "m2po"):
+        raise ValueError(f"loss_mode must be 'clip' or 'm2po', got {cfg.loss_mode!r}")
     import os
 
     from algos import NEEDS_CRITIC, NEEDS_GROUP

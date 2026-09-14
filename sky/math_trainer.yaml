@@ -9,6 +9,7 @@ resources:
 envs:
   CFG: configs/math_async_vllm.yaml
   NANORL_TOKEN: nanorl-e2e
+  ARGS: ""
 workdir: .
 setup: |
   command -v uv >/dev/null || pip install -q uv
@@ -19,4 +20,4 @@ setup: |
 run: |
   export HF_HOME=$HOME/.cache/huggingface
   export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-  python train.py --config $CFG --role trainer --serve-port 8000
+  python train.py --config $CFG --role trainer --serve-port 8000 $ARGS
