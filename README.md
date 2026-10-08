@@ -2,7 +2,7 @@
 
 One RL training loop that scales from a laptop CPU to a GPU cluster. **No GPU required**: the
 same disaggregated trainer/worker setup that runs on 16 GPUs runs as two pods on your laptop.
-~2,200 lines across 7 files, no Ray, TRL or DeepSpeed. Like
+~2,500 lines across 7 files, no Ray, TRL or DeepSpeed. Like
 [nanoGPT](https://github.com/karpathy/nanoGPT), a codebase to fork, not a library to import.
 
 ```python
@@ -97,11 +97,12 @@ All off by default, and a few lines of code each:
 | `--dual-clip 3` | Floor the surrogate where the advantage is negative and PPO's clip is one-sided |
 | `--overlong-coef 0.5` | Penalize completions that crowd the token budget |
 | `--eval-k 8` | pass@k at temperature 1 instead of greedy pass@1 |
+| `--max-turns 3` | Multi-turn episodes: the task's `env_response()` answers each turn until it returns None. Countdown's calculator replies `4*5+2 = 22, not 23. Try again.`; eval scores the final turn as `acc` and the first as `acc_turn1` |
 
 `--skip-zero-adv` is on by default. A group scoring uniformly has zero advantage, so its
 forward/backward is skipped. That is a speedup only, since the loss denominators still count
 its tokens. Log columns: `entropy` (which falls before the reward does), `clipfrac`, `akl`,
-`resp_len`, `trunc`, `dead`.
+`resp_len`, `trunc`, `dead`, and `turns` under `--max-turns`.
 
 ## Layout
 
@@ -110,18 +111,20 @@ algos.py    ~90   advantage estimators: reinforce / baseline / ppo (GAE) / grpo 
 core.py    ~120   Trajectory + Batch
 utils.py   ~170   masked reductions, returns/GAE, dist plumbing, CSV logger
 serve.py   ~250   async transport: weight publishing, rollout queue, staleness rejection
-model.py   ~380   MLPPolicy, HFPolicy (train + score), VLLMGenerator (rollout only)
-tasks.py   ~450   CartPole, IFEval, Countdown, GSM8K; task = sample + rollout + reward fns
-train.py   ~700   the loop: rollout, advantage, clipped update, publish
+model.py   ~420   MLPPolicy, HFPolicy (train + score), VLLMGenerator (rollout only)
+tasks.py   ~660   CartPole, IFEval, Countdown, GSM8K; task = sample + rollout + reward fns
+train.py   ~780   the loop: rollout, advantage, clipped update, publish
 ```
 
 `--role trainer` on one box and `--role rollout` on the others talk over stdlib HTTP;
-`max_staleness` is rejection bound, queue depth and snapshot count at once. 65 CPU-only tests:
+`max_staleness` is rejection bound, queue depth and snapshot count at once. 75 CPU-only tests:
 `python tests/test_nanorl.py`.
 
 A dataset is an `LLMTask` subclass: load rows, write `build_prompt`, pick reward functions
-`(prompt, completion, answer) -> float`, register in `make_task`. Any `AutoModelForCausalLM`
-works with `--model` (~12B on 48 GB with LoRA). Not included: Megatron-scale parallelism, MoE,
-multi-tenant scheduling, dashboards.
+`(prompt, completion, answer) -> float`, register in `make_task`. Override
+`env_response(problem, turns)` to make it multi-turn: each reply is appended to the sampled
+token ids, never re-rendered, and only the model's turns are trained. Any
+`AutoModelForCausalLM` works with `--model` (~12B on 48 GB with LoRA). Not included:
+Megatron-scale parallelism, MoE, multi-tenant scheduling, dashboards.
 
 MIT

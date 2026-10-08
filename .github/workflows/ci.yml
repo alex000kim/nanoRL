@@ -19,7 +19,8 @@ jobs:
           uv pip install --system --index-url https://download.pytorch.org/whl/cpu torch
           uv pip install --system transformers "datasets<4" gymnasium numpy pyyaml
       - name: Run tests
-        # these tests download a ~2MB tiny model and the 12MB RLVR-IFeval split; require them
+        # these tests download a ~2MB tiny model, the 12MB RLVR-IFeval split and the Qwen3
+        # tokenizer (multi-turn chat template); require them
         # rather than let them skip silently
         env:
           NANORL_REQUIRE_LLM_TEST: "1"

@@ -55,6 +55,16 @@ def test_discounted_returns_respects_mask():
     assert torch.allclose(g, torch.tensor([[2.0, 1.0, 0.0]]), atol=1e-6)
 
 
+def test_discounted_returns_carry_across_env_turns():
+    """A multi-turn row is assistant tokens, then env-reply tokens (mask 0), then more
+    assistant tokens. The final reward must reach the first turn, undiscounted by the
+    env tokens, which are not decisions."""
+    r = torch.tensor([[0.0, 0.0, 0.0, 0.0, 1.0, 0.0]])
+    m = torch.tensor([[1.0, 1.0, 0.0, 0.0, 1.0, 0.0]])
+    g = discounted_returns(r, m, gamma=0.5)
+    assert torch.allclose(g, torch.tensor([[0.25, 0.5, 0.0, 0.0, 1.0, 0.0]]), atol=1e-6)
+
+
 def test_gae_terminal_equals_reward_minus_value():
     # single-step episode: A = r - V(s0), return target = r
     r = torch.tensor([[1.0, 0.0]])
@@ -176,6 +186,18 @@ def test_countdown_reward():
     assert countdown_reward("", "no answer", prob) == 0.0
     # "expr = target" scores on the LHS only — the RHS digits must not count as used numbers
     assert countdown_reward("", "<answer>4*5+3 = 23</answer>", prob) == 1.0
+
+
+def test_countdown_feedback_agrees_with_the_reward():
+    """The multi-turn env and the reward are one checker: feedback must be silent exactly
+    when the reward is 1, and must say what the calculator saw otherwise."""
+    from tasks import countdown_check
+    prob = {"nums": [3, 4, 5], "target": 23}
+    for c in ("<answer>4*5+3</answer>", "<answer>3*5+4*2</answer>", "<answer>3+4+5</answer>",
+              "no answer", "<answer>x</answer>", "<answer>4*5+3 = 23</answer>"):
+        assert (countdown_check(c, prob) is None) == (countdown_reward("", c, prob) == 1.0), c
+    assert countdown_check("<answer>3+4+5</answer>", prob) == "3+4+5 = 12, not 23."
+    assert "exactly once" in countdown_check("<answer>3*5+4*2</answer>", prob)
 
 
 # --------------------------------------------------------------------------- #
@@ -691,7 +713,9 @@ def test_train_rejects_bad_combos():
                      (dict(role="trainer", tis_clip=0.5), "tis-clip"),
                      (dict(dual_clip=0.9), "dual-clip"),
                      (dict(eps=0.2, eps_high=0.1), "eps-high"),
-                     (dict(eval_k=0), "eval-k")):
+                     (dict(eval_k=0), "eval-k"),
+                     (dict(max_turns=0), "max-turns"),
+                     (dict(max_turns=3), "max-turns")):   # cartpole: already multi-step
         try:
             validate(Config(**bad))
             raise AssertionError(f"should reject {bad}")
@@ -974,6 +998,239 @@ def test_llm_end_to_end_step():
     assert not torch.equal(p0, next(p for p in pol.model.parameters() if p.requires_grad))
 
 
+def test_multi_turn_episode_trains_on_assistant_tokens_only():
+    """A multi-turn episode is ONE sequence: prompt, turn, env reply, turn, ... The mask must
+    cover exactly the sampled turns (never the env's tokens), old_logp must match a fresh
+    recompute over the whole transcript (ratio 1 on every turn, not just the last), and the
+    episode must end when the env says so."""
+    try:
+        from model import HFPolicy
+        pol = HFPolicy("hf-internal-testing/tiny-random-gpt2", device="cpu", dtype="float32",
+                       micro_batch=2)
+    except Exception:
+        if os.environ.get("NANORL_REQUIRE_LLM_TEST"):
+            raise
+        _SKIPPED.append("test_multi_turn_episode_trains_on_assistant_tokens_only")
+        return
+    from tasks import LLMTask
+    from algos import grpo
+    from train import Config, optimize
+
+    counter = iter(range(10_000))
+
+    class Toy(LLMTask):
+        reward_fns = [(lambda p, c, a: float(next(counter) % 3), 1.0)]
+        max_turns = 3
+        def build_prompt(self, p): return f"count {p['x']}"
+        def env_response(self, problem, turns):   # problem 1 is "solved" on its first turn
+            return None if problem["x"] == 1 else f"reply {len(turns)}"
+
+    task, probs = Toy(), [{"x": 0}, {"x": 1}]
+    torch.manual_seed(0)
+    texts = [task.prompt_text(pol, p) for p in probs]
+    trajs, turns = task._episodes(pol, texts, probs, 2, max_new_tokens=5, temperature=1.0,
+                                  top_p=1.0)
+    for i, (tr, ts) in enumerate(zip(trajs, turns)):
+        assert len(ts) == (3 if i < 2 else 1)
+        assert torch.equal(tr.states[tr.mask.bool()], torch.cat(ts)), "mask != sampled turns"
+        runs = int((torch.diff(tr.mask, prepend=torch.zeros(1)) > 0).sum())
+        assert runs == len(ts)
+        assert tr.truncated == any(int(t[-1]) not in pol.stop_ids for t in ts)
+    assert "reply 2" in pol.tok.decode(trajs[0].states[~trajs[0].mask.bool()])
+
+    batch = Batch.from_groups([trajs[:2], trajs[2:]])
+    ratio = torch.exp(pol.logprobs(batch) - batch.old_logp)[batch.mask.bool()]
+    assert torch.allclose(ratio, torch.ones_like(ratio), atol=1e-4), ratio.min().item()
+
+    batch = task.rollout(pol, probs, group_size=4, max_new_tokens=5)
+    last = batch.mask.shape[1] - 1 - batch.mask.flip(-1).argmax(-1)    # last assistant token
+    assert torch.equal(batch.rewards.nonzero()[:, 1], last[batch.rewards.sum(-1) != 0])
+    adv = grpo(batch, pol)
+    assert adv.abs().sum() > 0
+    assert (adv[~batch.mask.bool()] == 0).all(), "env tokens must carry no advantage"
+    cfg = Config(model="tiny", max_new_tokens=5, max_turns=3, micro_batch=2)
+    diag = optimize(pol, torch.optim.AdamW(pol.parameters(), lr=1e-4), batch, adv, cfg)
+    assert diag["gnorm"] > 0
+    task.eval_data = probs
+    out = task.evaluate(pol, n=2, max_new_tokens=5)
+    assert set(out) == {"acc", "acc_turn1"}
+
+
+def test_sync_old_logp_is_scored_in_the_update_shapes():
+    """ratio == 1 on epoch 0 must hold bit-for-bit, not to a tolerance. old_logp scored per
+    generate() chunk or per turn is a forward at a different GEMM shape than the update's, and
+    under bf16 that rounds differently (measured on GPU: up to 0.5 nats, spuriously clipped).
+    The sync source must score the assembled batch exactly as optimize() does: same chunks,
+    and the same train-mode, checkpointed forward."""
+    try:
+        from model import HFPolicy
+        pol = HFPolicy("hf-internal-testing/tiny-random-gpt2", device="cpu", dtype="bfloat16",
+                       micro_batch=3, gen_batch=2, grad_ckpt=True)   # chunks != update's
+    except Exception:
+        if os.environ.get("NANORL_REQUIRE_LLM_TEST"):
+            raise
+        _SKIPPED.append("test_sync_old_logp_is_scored_in_the_update_shapes")
+        return
+    from algos import grpo
+    from tasks import LLMTask
+    from train import Config, SyncSource, optimize, rollout_kwargs
+
+    counter = iter(range(10_000))
+
+    class Toy(LLMTask):
+        reward_fns = [(lambda p, c, a: float(next(counter) % 2), 1.0)]   # no dead groups
+        max_turns = 3
+        def sample(self, n): return [{"x": i} for i in range(n)]
+        def build_prompt(self, p): return "count " * (1 + 3 * p["x"])
+        def env_response(self, problem, turns): return "again " * len(turns)
+
+    cfg = Config(task="countdown", model="tiny", group_size=2, micro_batch=3, max_new_tokens=6,
+                 max_turns=3)
+    torch.manual_seed(0)
+    batch, _ = SyncSource(Toy(), cfg, rollout_kwargs(cfg), 3).next_batch(pol)
+    update = torch.cat([pol.logprobs(mb).detach()          # with grad, as optimize() runs it
+                        for _, mb in batch.micro_batches(cfg.micro_batch)])
+    assert torch.equal(update, batch.old_logp)
+    diag = optimize(pol, torch.optim.SGD(pol.parameters(), lr=0.0), batch, grpo(batch, pol), cfg)
+    assert diag["ratio"] == 1.0 and diag["clipfrac"] == 0.0 and diag["skipped"] == 0
+
+
+class _ScriptedPol:
+    """No model: the k-th act() call answers every prompt with script[k] = (text, stopped),
+    through the real Qwen3 tokenizer and chat template."""
+
+    def __init__(self, tok, script, max_len=None):
+        self.tok, self.script, self.calls = tok, script, 0
+        if max_len:
+            self.max_len = max_len
+
+    def format_prompt(self, u, s=None):
+        from model import chat_prompt
+        return chat_prompt(self.tok, u, s, False)
+
+    def format_reply(self, m):
+        from model import chat_reply
+        return chat_reply(self.tok, m, False)
+
+    def act(self, prompts, group_size, **kw):
+        text, stopped = self.script[self.calls]
+        self.calls += 1
+        comp = self.tok(text, add_special_tokens=False).input_ids
+        comp += [self.tok.convert_tokens_to_ids("<|im_end|>")] if stopped else []
+        out = []
+        for p in prompts:
+            ids = self.tok(p, add_special_tokens=False).input_ids if isinstance(p, str) else p
+            full = torch.tensor(list(ids) + comp)
+            m = torch.zeros(len(full))
+            m[len(ids):] = 1.0
+            out += [Trajectory(full, full.clone(), torch.zeros(len(full)), torch.zeros(len(full)),
+                               m, truncated=not stopped) for _ in range(group_size)]
+        return out
+
+
+def _scripted_countdown(name):
+    """(task, tokenizer, problem) for the scripted-policy tests, or None if offline."""
+    try:
+        from transformers import AutoTokenizer
+        tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
+    except Exception:
+        if os.environ.get("NANORL_REQUIRE_LLM_TEST"):
+            raise
+        _SKIPPED.append(name)
+        return None
+    from tasks import CountdownTask, LLMTask, countdown_reward
+
+    class Task(LLMTask):
+        reward_fns = [(countdown_reward, 1.0)]
+        max_turns = 2
+        build_prompt = CountdownTask.build_prompt
+        env_response = CountdownTask.env_response
+
+    return Task(), tok, {"nums": [1, 2, 4], "target": 7}
+
+
+WRONG, RIGHT = "<answer>1+2</answer>", "<answer>4*2-1</answer>"
+
+
+def test_multi_turn_transcript_matches_the_chat_template():
+    """Between two turns there must be exactly one end-of-turn marker (the stop token the
+    model sampled, not a second copy from the template), then the env's message in the
+    template's user format, then the same assistant header turn 1 opened with."""
+    setup = _scripted_countdown("test_multi_turn_transcript_matches_the_chat_template")
+    if setup is None:
+        return
+    from model import chat_prompt, chat_reply
+    task, tok, prob = setup
+    pol = _ScriptedPol(tok, [(WRONG, True), (WRONG, True)])
+    text = task.prompt_text(pol, prob)
+    (tr,), _ = task._episodes(pol, [text], [prob], 1, 8, 1.0, 1.0)
+    fb = "1+2 does not use each of [1, 2, 4] exactly once. Try again."
+    want = (text + WRONG + "<|im_end|>\n<|im_start|>user\n" + fb + "<|im_end|>\n"
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n" + WRONG + "<|im_end|>")
+    assert tok.decode(tr.states) == want
+    for think in (False, True):   # turn 2 reopens exactly the header turn 1 opened
+        assert (chat_reply(tok, "YYY", think).split("YYY")[1]
+                == chat_prompt(tok, "QQQ", None, think).split("QQQ")[1])
+
+
+def test_multi_turn_eval_scores_the_last_turn_and_the_first():
+    """acc is the episode's outcome (solved by its final turn), acc_turn1 the first attempt;
+    swapping them would invert the metric that says whether feedback helps. A solved turn
+    ends the episode (the script has no second entry, so another act() would raise)."""
+    setup = _scripted_countdown("test_multi_turn_eval_scores_the_last_turn_and_the_first")
+    if setup is None:
+        return
+    task, tok, prob = setup
+    task.eval_data = [prob]
+    out = task.evaluate(_ScriptedPol(tok, [(WRONG, True), (RIGHT, True)]), n=1)
+    assert out == {"acc": 1.0, "acc_turn1": 0.0}
+    _, turns = task._episodes(_ScriptedPol(tok, [(RIGHT, True)]),
+                              [task.prompt_text(_ScriptedPol(tok, []), prob)], [prob], 1, 8,
+                              0.0, 1.0)
+    assert len(turns[0]) == 1
+
+
+def test_multi_turn_truncated_turn_marks_the_episode():
+    """A turn cut off at the budget gets a reply (the template's end-of-turn closes it), but
+    the episode counts as truncated: overlong_filter drops it and overlong_coef charges it,
+    even when a later turn finishes cleanly and solves the puzzle."""
+    setup = _scripted_countdown("test_multi_turn_truncated_turn_marks_the_episode")
+    if setup is None:
+        return
+    task, tok, prob = setup
+    ramble = "word " * 40
+    budget = len(tok(ramble, add_special_tokens=False).input_ids)
+    script = [(ramble, False), (RIGHT, True)]
+    text = task.prompt_text(_ScriptedPol(tok, []), prob)
+    (tr,), _ = task._episodes(_ScriptedPol(tok, script), [text], [prob], 1, budget, 1.0, 1.0)
+    cut = len(tok(text, add_special_tokens=False).input_ids) + budget
+    end = tok.convert_tokens_to_ids("<|im_end|>")
+    assert int(tr.states[cut]) == end and int(tr.states[cut - 1]) != end
+    assert tr.truncated
+    b = task.rollout(_ScriptedPol(tok, script), [prob], 1, max_new_tokens=budget,
+                     overlong_coef=1.0)
+    assert b.truncated.tolist() == [1.0]
+    assert b.terminal_rewards().tolist() == [0.0]   # solved (+1), turn 1 at the budget (-1)
+    task.overlong_filter = True
+    assert task.rollout(_ScriptedPol(tok, script), [prob], 1, max_new_tokens=budget).mask.sum() == 0
+
+
+def test_multi_turn_episode_ends_before_the_context_fills():
+    """vLLM rejects a prompt as long as its context. An episode whose next prompt would not
+    fit policy.max_len must end there instead of crashing the rollout worker."""
+    setup = _scripted_countdown("test_multi_turn_episode_ends_before_the_context_fills")
+    if setup is None:
+        return
+    task, tok, prob = setup
+    text = task.prompt_text(_ScriptedPol(tok, []), prob)
+    first = len(tok(text + WRONG, add_special_tokens=False).input_ids) + 1   # + stop token
+    script = [(WRONG, True), (RIGHT, True)]
+    for max_len, n_turns in ((first + 5, 1), (first + 200, 2), (None, 2)):
+        _, turns = task._episodes(_ScriptedPol(tok, script, max_len), [text], [prob], 1, 8,
+                                  1.0, 1.0)
+        assert len(turns[0]) == n_turns, (max_len, len(turns[0]))
+
+
 def test_uniform_group_gives_zero_advantage():
     """A group where every sample scores the same has no signal — GRPO's advantage is exactly
     0 and the step is a no-op. Documented behavior, not a bug: it's why group_size and reward
@@ -1150,7 +1407,8 @@ def test_worker_and_trainer_split_fingerprints():
         cli = RolloutClient("http://127.0.0.1:8735")
         cli.wait_for_trainer(timeout=30)
         assert cli.fetch_config() == fp              # survives the wire verbatim
-        for k, v in (("seed", 1), ("n_examples", 999), ("eval_n", 7), ("task", "gsm8k")):
+        for k, v in (("seed", 1), ("n_examples", 999), ("eval_n", 7), ("task", "gsm8k"),
+                     ("max_turns", 3)):
             assert split_fingerprint(Config(task="countdown", model="m", **{k: v}) if k != "task"
                                      else Config(task=v, model="m")) != fp, k
     finally:

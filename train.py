@@ -67,6 +67,8 @@ class Config:
     overlong_filter: bool = False   # DAPO overlong filtering: truncated seqs get no gradient
                                     # (use INSTEAD of overlong_coef, which baits length collapse)
     format_gate: bool = False       # no format credit for ultra-short completions
+    max_turns: int = 1              # >1: multi-turn episodes; the task's env_response() replies
+                                    # to each assistant turn (max_new_tokens is per turn)
     # LLM knobs
     max_new_tokens: int = 256
     temperature: float = 1.0
@@ -138,6 +140,17 @@ def make_ref(policy, cfg):
 
 
 @torch.no_grad()
+def score_batch(policy, batch, cfg) -> torch.Tensor:
+    """logp of every token under the current weights, chunked exactly as optimize() chunks
+    the update: same rows, same padded length, so the same GEMM shapes and a ratio of
+    exactly 1 on epoch 0. Scored at any other shape, a bf16 LoRA forward rounds differently
+    (measured, Qwen3-8B: up to 0.5 nats on 0.5-1.4% of tokens, spuriously clipped)."""
+    size = cfg.micro_batch if cfg.model else 0
+    return torch.cat([policy.logprobs(mb).detach().cpu()
+                      for _, mb in batch.micro_batches(size)], dim=0)
+
+
+@torch.no_grad()
 def recompute_old_logp(policy, batch, snap: dict, cfg):
     """Recompute old_logp under the weights that sampled this batch, with the trainer's own
     kernels. Worker logprobs (esp. vLLM's) come from different numerics and would bias the
@@ -152,9 +165,7 @@ def recompute_old_logp(policy, batch, snap: dict, cfg):
     backup = {n: p.detach().clone() for n, p in named}
     for n, p in named:                     # swap in the sampling version
         p.copy_(snap[n].to(device=p.device, dtype=p.dtype))
-    size = cfg.micro_batch if cfg.model else 0
-    old = torch.cat([policy.logprobs(mb).detach().cpu()
-                     for _, mb in batch.micro_batches(size)], dim=0)
+    old = score_batch(policy, batch, cfg)
     for n, p in named:                     # restore the training version
         p.copy_(backup[n])
     return old
@@ -166,7 +177,7 @@ def split_fingerprint(cfg: Config) -> str:
     problems and the eval metric silently inflates. The trainer serves this string and every
     worker asserts against it before generating."""
     import json
-    keys = ("task", "model", "seed", "n_examples", "eval_n", "think")
+    keys = ("task", "model", "seed", "n_examples", "eval_n", "think", "max_turns")
     return json.dumps({k: getattr(cfg, k) for k in keys}, sort_keys=True)
 
 
@@ -183,7 +194,8 @@ def loss_denoms(batch, cfg) -> dict:
     dev = batch.mask.device
     return {"tokens": all_sum(batch.mask.sum(), dev).clamp_min(1.0),
             "seqs": all_sum(float(batch.mask.shape[0]), dev),
-            "const": all_sum(batch.mask.shape[0] * float(cfg.max_new_tokens), dev)}
+            "const": all_sum(batch.mask.shape[0] * float(cfg.max_new_tokens * cfg.max_turns),
+                             dev)}
 
 
 def rollout_kwargs(cfg) -> dict:
@@ -215,6 +227,9 @@ def batch_stats(batch, cfg) -> dict:
         # `dead` cannot show this: those groups are not dead.
         out["levels"] = round(float(
             torch.tensor([len(torch.unique(r)) for r in R], dtype=torch.float).mean()), 2)
+    if cfg.max_turns > 1:   # assistant turns per episode = runs of 1s in the mask
+        runs = (torch.diff(batch.mask, dim=-1, prepend=batch.mask[:, :1] * 0) > 0).sum(-1)
+        out["turns"] = round(float(runs[runs > 0].float().mean()), 2) if runs.any() else 0.0
     return out
 
 
@@ -369,8 +384,8 @@ def validate(cfg: Config) -> None:
     if cfg.tis_clip and cfg.role != "trainer":
         raise ValueError("--tis-clip corrects the sampling engine's numerics against the "
                          "trainer's, so it needs the worker logprobs that only --role trainer "
-                         "receives. In sync mode both come from one forward and the weight "
-                         "would be exactly 1 — a silent no-op.")
+                         "receives. Sync mode samples with the trainer's own weights and keeps "
+                         "no sampler logprobs, so the weight would never apply — a silent no-op.")
     if cfg.tis_clip and cfg.tis_clip < 1.0:
         raise ValueError(f"--tis-clip {cfg.tis_clip} is a CEILING on an importance ratio and "
                          f"must be >= 1 (2-3 is usual); 0 disables it.")
@@ -381,6 +396,9 @@ def validate(cfg: Config) -> None:
     if cfg.eps_high and cfg.eps_high < cfg.eps:
         raise ValueError(f"--eps-high {cfg.eps_high} < --eps {cfg.eps}: clip-higher RAISES the "
                          f"upper bound (try 0.28 against eps 0.2); 0 makes the clip symmetric.")
+    if cfg.max_turns < 1 or (cfg.max_turns > 1 and not cfg.model):
+        raise ValueError(f"--max-turns must be >= 1 (got {cfg.max_turns}) and >1 only for LLM "
+                         f"tasks: a control episode is already multi-step.")
     if cfg.eval_k < 1:
         raise ValueError(f"--eval-k must be >= 1 (got {cfg.eval_k}); 1 is greedy pass@1.")
     if cfg.ent_coef and cfg.model:
@@ -414,7 +432,13 @@ class SyncSource:
 
     def next_batch(self, policy):
         prompts = self.task.sample(self.n)
-        return self.task.rollout(policy, prompts, self.cfg.group_size, **self.roll_kw), 0
+        if not self.cfg.model:
+            return self.task.rollout(policy, prompts, self.cfg.group_size, **self.roll_kw), 0
+        # old_logp from one pass over the assembled batch, not per generate() chunk and turn
+        batch = self.task.rollout(policy, prompts, self.cfg.group_size, score=False,
+                                  **self.roll_kw)
+        batch.old_logp = score_batch(policy, batch, self.cfg)
+        return batch, 0
 
     def publish(self, policy):
         pass
@@ -534,7 +558,7 @@ def rollout_worker(cfg: Config):
     task = make_task(cfg.task, n_examples=cfg.n_examples, seed=cfg.seed, gamma=cfg.gamma,
                      n_eval=cfg.eval_n, rank=wid, world=wtot,
                      adapt_sample=cfg.adapt_sample, overlong_filter=cfg.overlong_filter,
-                     format_gate=cfg.format_gate)
+                     format_gate=cfg.format_gate, max_turns=cfg.max_turns)
     if cfg.vllm:
         from model import VLLMGenerator
         policy = VLLMGenerator(cfg.model, dtype=cfg.dtype, lora_r=cfg.lora_r,
@@ -622,7 +646,7 @@ def train(cfg: Config):
     task = make_task(cfg.task, n_examples=cfg.n_examples, seed=cfg.seed, gamma=cfg.gamma,
                      n_eval=cfg.eval_n, rank=rank, world=world,
                      adapt_sample=cfg.adapt_sample, overlong_filter=cfg.overlong_filter,
-                     format_gate=cfg.format_gate)
+                     format_gate=cfg.format_gate, max_turns=cfg.max_turns)
     if cfg.debug_samples and is_main():
         task.debug_samples = cfg.debug_samples
     policy = make_policy(cfg, task)

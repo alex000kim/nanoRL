@@ -169,20 +169,27 @@ def _safe_eval(expr: str) -> Fraction | None:
     return ev(node)
 
 
-def countdown_reward(prompt, completion, answer) -> float:
-    """1.0 iff <answer> is an expression using each provided number exactly once and
-    evaluating to the target. The calculator IS the reward model — no labels, no RM."""
+def countdown_check(completion, answer) -> str | None:
+    """None iff <answer> is an expression using each provided number exactly once and
+    evaluating to the target; otherwise what the calculator says is wrong with it."""
     ans = extract_answer(completion)
     if ans is None:
-        return 0.0
+        return "No <answer> </answer> tags found."
     expr = ans.split("=")[0].strip()   # tolerate "expr = 23": score the LHS only
     if not re.fullmatch(r"[0-9+\-*/() .]+", expr or ""):
-        return 0.0
+        return "The expression may only contain digits, + - * / and parentheses."
     used = [float(x) for x in re.findall(r"\d+\.?\d*", expr)]   # "3.0" is one number, not [3,0]
     if sorted(used) != sorted(float(n) for n in answer["nums"]):  # each number used exactly once
-        return 0.0
+        return f"{expr} does not use each of {answer['nums']} exactly once."
     val = _safe_eval(expr)
-    return 1.0 if val is not None and val == Fraction(answer["target"]) else 0.0
+    if val is None:
+        return f"{expr} cannot be evaluated."
+    return None if val == Fraction(answer["target"]) else f"{expr} = {val}, not {answer['target']}."
+
+
+def countdown_reward(prompt, completion, answer) -> float:
+    """The calculator IS the reward model — no labels, no RM."""
+    return float(countdown_check(completion, answer) is None)
 
 
 def gsm8k_reward(prompt, completion, answer) -> float:
@@ -250,6 +257,12 @@ class LLMTask:
     adapt_sample: bool = False  # weight sampling toward prompts whose groups still spread
     overlong_filter: bool = False  # DAPO-style: no gradient through truncated sequences
     format_gate: bool = False      # format credit only for non-trivial-length completions
+    max_turns: int = 1             # >1: env_response() answers each turn until it returns None
+
+    def env_response(self, problem, turns: list[str]) -> str | None:
+        """The environment's reply to the latest of an episode's assistant `turns`, or None
+        to end the episode. Tasks that support --max-turns > 1 override this."""
+        return None
 
     def _split(self, rows: list, n_eval: int, seed: int = 0) -> None:
         """First n_eval rows are the eval holdout; the rest is strided disjointly by rank.
@@ -297,24 +310,77 @@ class LLMTask:
     def prompt_text(self, policy, p) -> str:
         return policy.format_prompt(self.build_prompt(p), self.system_prompt)
 
+    def _episodes(self, policy, texts: list[str], problems: list, group_size: int,
+                  max_new_tokens: int, temperature: float, top_p: float, score: bool = True):
+        """Run group_size episodes per problem for up to max_turns assistant turns. Returns
+        (trajectories, turns): one Trajectory per episode spanning the whole transcript, mask
+        1 on every assistant token and 0 on env replies; turns[i] holds episode i's assistant
+        turns as token ids. Ordered [problem0]*G, [problem1]*G, ... A turn cut off by
+        max_new_tokens is replied to like any other (the reply's end-of-turn closes it), and
+        marks the whole episode truncated. An episode also ends when its next prompt would
+        fill the engine's context (policy.max_len; vLLM rejects such a prompt outright).
+
+        Later turns APPEND the env's reply to the exact sampled ids. Re-rendering the
+        transcript through the chat template instead would re-tokenize earlier turns, and
+        the update would then train tokens that were never sampled."""
+        kw = dict(max_new_tokens=max_new_tokens, temperature=temperature, top_p=top_p,
+                  score=score)
+        cap = getattr(policy, "max_len", None)
+        trajs = policy.act(texts, group_size, **kw)
+        turns = [[tr.states[tr.mask.bool()]] for tr in trajs]
+        live = range(len(trajs))
+        for _ in range(self.max_turns - 1):
+            nxt, ids = [], []
+            for i in live:
+                msg = self.env_response(problems[i // group_size],
+                                        [policy.tok.decode(t, skip_special_tokens=True)
+                                         for t in turns[i]])
+                if msg is None:
+                    continue
+                rep = policy.tok(policy.format_reply(msg), add_special_tokens=False).input_ids
+                if rep[0] == int(trajs[i].states[-1]):
+                    rep = rep[1:]   # the template's end-of-turn is the stop token just sampled
+                seq = trajs[i].states.tolist() + rep
+                if cap is None or len(seq) < cap:
+                    nxt.append(i)
+                    ids.append(seq)
+            live = nxt
+            if not live:
+                break
+            for i, new in zip(live, policy.act(ids, 1, **kw)):
+                old, n = trajs[i], trajs[i].states.shape[0]
+                if not torch.equal(new.states[:n], old.states):
+                    raise RuntimeError("policy.act altered a token-id prompt; the turn masks "
+                                       "would no longer line up with the sampled tokens")
+                turns[i].append(new.states[new.mask.bool()])
+                # earlier turns keep their mask and the logprobs of the engine that sampled them
+                new.mask[:n], new.old_logp[:n] = old.mask, old.old_logp
+                new.truncated = new.truncated or old.truncated
+                trajs[i] = new
+        return trajs, turns
+
     def rollout(self, policy, prompts: list, group_size: int, max_new_tokens: int = 256,
                 temperature: float = 1.0, top_p: float = 1.0,
-                overlong_coef: float = 0.0) -> Batch:
+                overlong_coef: float = 0.0, score: bool = True) -> Batch:
+        """score=False leaves old_logp zero for a caller that scores the batch itself."""
         texts = [self.prompt_text(policy, p) for p in prompts]
-        flat = policy.act(texts, group_size, max_new_tokens=max_new_tokens,
-                          temperature=temperature, top_p=top_p)
-        # flat is a list of Trajectory, ordered [prompt0]*G, [prompt1]*G, ...
+        flat, turns = self._episodes(policy, texts, prompts, group_size, max_new_tokens,
+                                     temperature, top_p, score)
+        start = int(flat[0].mask.nonzero()[0]) if self.debug_samples else 0  # before filtering
         groups = []
         for pi, problem in enumerate(prompts):
             group = flat[pi * group_size : (pi + 1) * group_size]
-            for tr in group:
-                comp_ids = tr.states[tr.mask.bool()]
-                completion = policy.tok.decode(comp_ids, skip_special_tokens=True)
+            for j, tr in enumerate(group):
+                # scored on the final turn: an env ends the episode once it is solved
+                ep = turns[pi * group_size + j]
+                completion = policy.tok.decode(ep[-1], skip_special_tokens=True)
                 total = 0.0
                 for fn, w in self.reward_fns:
                     total += w * fn(texts[pi], completion, problem)
-                if overlong_coef:   # length shaping is a property of the rollout, not the text
-                    total += overlong_coef * overlong_penalty(int(tr.mask.sum()), max_new_tokens)
+                if overlong_coef:   # length shaping is a property of the rollout, not the text;
+                    # the budget is per turn, so the episode pays for its longest turn
+                    total += overlong_coef * min(overlong_penalty(len(t), max_new_tokens)
+                                                 for t in ep)
                 # terminal reward on the LAST completion token
                 last = int(tr.mask.nonzero()[-1].item())
                 tr.rewards[last] = total
@@ -334,9 +400,11 @@ class LLMTask:
             # look identical in the metrics
             self.debug_samples -= 1
             tr = groups[0][0]
-            comp = policy.tok.decode(tr.states[tr.mask.bool()], skip_special_tokens=False)
-            print(f"[sample] prompt={texts[0][-200:]!r}\n[sample] completion={comp[:600]!r}\n"
-                  f"[sample] reward={float(tr.rewards.sum()):.3f}", flush=True)
+            comp = policy.tok.decode(tr.states[start:], skip_special_tokens=False)
+            tail = (f"\n[sample] ...{comp[-600:]!r}"
+                    if self.max_turns > 1 and len(comp) > 1200 else "")
+            print(f"[sample] prompt={texts[0][-200:]!r}\n[sample] completion={comp[:600]!r}"
+                  f"{tail}\n[sample] reward={float(tr.rewards.sum()):.3f}", flush=True)
         return batch
 
     def evaluate(self, policy, n: int = 32, max_new_tokens: int = 256, k: int = 1) -> dict:
@@ -347,28 +415,42 @@ class LLMTask:
         (pass_k). Greedy pass@1 cannot separate "the policy learned something" from "the
         policy sharpened onto what it could already do" — a rising acc with a flat pass_k is
         the second one, and it is the usual reason a run plateaus.
+
+        Multi-turn: acc scores the final turn, acc_turn1 the first. acc_turn1 rising alone
+        means a better first attempt; the gap between the two is what using feedback buys.
         """
         from utils import all_sum
 
         problems = self.eval_data[:n][self.rank :: self.world]
-        hits = solved = 0.0
+        hits = solved = first = 0.0
         if problems:
             texts = [self.prompt_text(policy, p) for p in problems]
-            # generate-only: eval never needs old_logp, computing it would double the cost
-            completions = policy.generate([t for t in texts for _ in range(k)],
-                                          max_new_tokens=max_new_tokens,
-                                          temperature=1.0 if k > 1 else 0.0)
+            temp = 1.0 if k > 1 else 0.0
+            if self.max_turns > 1:
+                # score=False: eval never needs old_logp, computing it would double the cost
+                _, turns = self._episodes(policy, texts, problems, k, max_new_tokens, temp,
+                                          1.0, score=False)
+                completions, firsts = ([policy.tok.decode(t[j], skip_special_tokens=True)
+                                        for t in turns] for j in (-1, 0))
+            else:
+                # generate-only: eval never needs old_logp, computing it would double the cost
+                completions = policy.generate([t for t in texts for _ in range(k)],
+                                              max_new_tokens=max_new_tokens, temperature=temp)
             primary = self.reward_fns[0][0]
             for i, (t, p) in enumerate(zip(texts, problems)):
                 got = [primary(t, c, p) for c in completions[i * k : (i + 1) * k]]
                 hits += sum(got)
                 solved += float(any(g > 0 for g in got))
+                if self.max_turns > 1:
+                    first += sum(primary(t, c, p) for c in firsts[i * k : (i + 1) * k])
         dev = getattr(policy, "device", None)
         tot_hits = float(all_sum(hits, dev))
         tot_n = float(all_sum(len(problems), dev))
         out = {"acc": tot_hits / max(tot_n * k, 1.0)}
         if k > 1:
             out["pass_k"] = float(all_sum(solved, dev)) / max(tot_n, 1.0)
+        if self.max_turns > 1:
+            out["acc_turn1"] = float(all_sum(first, dev)) / max(tot_n * k, 1.0)
         return out
 
 
@@ -501,6 +583,11 @@ class CountdownTask(LLMTask):
                 f"parentheses, write an expression equal to {p['target']}. Reason briefly, then "
                 f"put ONLY the expression (no '=') inside <answer> </answer> tags.")
 
+    def env_response(self, problem, turns: list[str]) -> str | None:
+        """The calculator reports what was wrong (e.g. "4*5+2 = 22, not 23.") until solved."""
+        err = countdown_check(turns[-1], problem)
+        return None if err is None else f"{err} Try again."
+
 
 class GSM8KTask(LLMTask):
     def __init__(self, split: str = "train", n_examples: int = 2000, seed: int = 0,
@@ -563,6 +650,10 @@ def make_task(name: str, **kw):
     task = llm(**keep("n_examples", "seed", "n_eval", "rank", "world"))
     task.adapt_sample = bool(kw.get("adapt_sample", False))
     task.overlong_filter = bool(kw.get("overlong_filter", False))
+    task.max_turns = int(kw.get("max_turns", 1))
+    if task.max_turns > 1 and type(task).env_response is LLMTask.env_response:
+        raise ValueError(f"--max-turns {task.max_turns}: task {name!r} has no env_response(), "
+                         f"so every episode would still end after one turn")
     if kw.get("format_gate"):
         task.reward_fns = [(fn if fn is not format_reward else gated_format_reward, w)
                            for fn, w in task.reward_fns]

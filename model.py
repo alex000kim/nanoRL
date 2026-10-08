@@ -91,6 +91,24 @@ def chat_prompt(tok, user_msg: str, system_msg: str | None, think: bool) -> str:
         return tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
 
 
+def chat_reply(tok, user_msg: str, think: bool) -> str:
+    """What the template puts after an assistant turn, through the next assistant header:
+    the env's reply in the model's own format, starting with the end-of-turn marker.
+    Rendered after a sentinel, not by diffing two full transcripts: templates rewrite past
+    turns (Qwen3 drops earlier <think> blocks), so one render is not a prefix of the next."""
+    if not tok.chat_template:
+        return f"\n{user_msg}\n"
+    mark = "<<nanorl-turn-end>>"
+    msgs = [{"role": "user", "content": "q"}, {"role": "assistant", "content": mark},
+            {"role": "user", "content": user_msg}]
+    try:
+        text = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True,
+                                       enable_thinking=think)
+    except TypeError:
+        text = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+    return text[text.index(mark) + len(mark):]
+
+
 class VLLMGenerator:
     """Generation-only policy backed by vLLM, for `--role rollout --vllm`.
 
@@ -117,11 +135,15 @@ class VLLMGenerator:
                        # slows engine startup
                        enforce_eager=True)
         self.lora_req = None          # set by set_adapter() on every weight sync
+        self.max_len = max_len        # multi-turn episodes end before a prompt fills it
         self.device = "cuda"
         self.v = None
 
     def format_prompt(self, user_msg: str, system_msg: str | None = None) -> str:
         return chat_prompt(self.tok, user_msg, system_msg, self.think)
+
+    def format_reply(self, user_msg: str) -> str:
+        return chat_reply(self.tok, user_msg, self.think)
 
     def set_adapter(self, path: str, version: int) -> None:
         """Point subsequent generations at the pulled adapter (version doubles as vLLM's id)."""
@@ -130,12 +152,16 @@ class VLLMGenerator:
 
     @torch.no_grad()
     def act(self, prompt_texts, group_size: int, max_new_tokens: int = 256,
-            temperature: float = 1.0, top_p: float = 1.0):
+            temperature: float = 1.0, top_p: float = 1.0, score: bool = True):
+        """prompt_texts: strings, or token-id lists (a later turn of an episode). `score` is
+        accepted for HFPolicy parity; vLLM's logprobs come free with sampling."""
         from core import Trajectory
         from vllm import SamplingParams
         sp = SamplingParams(n=group_size, temperature=max(temperature, 1e-6), top_p=top_p,
                             max_tokens=max_new_tokens, logprobs=0)
-        outs = self.llm.generate(prompt_texts, sp, lora_request=self.lora_req)
+        prompts = [p if isinstance(p, str) else {"prompt_token_ids": list(p)}
+                   for p in prompt_texts]
+        outs = self.llm.generate(prompts, sp, lora_request=self.lora_req)
         trajs = []
         for out in outs:                       # vLLM keeps the n samples grouped per prompt
             p_ids = list(out.prompt_token_ids)
@@ -253,15 +279,22 @@ class HFPolicy(nn.Module):
     def format_prompt(self, user_msg: str, system_msg: str | None = None) -> str:
         return chat_prompt(self.tok, user_msg, system_msg, self.think)
 
+    def format_reply(self, user_msg: str) -> str:
+        return chat_reply(self.tok, user_msg, self.think)
+
     # ---- rollout: sample completions and capture old logprobs ------------- #
     @torch.no_grad()
-    def act(self, prompt_texts: list[str], group_size: int, max_new_tokens: int = 256,
-            temperature: float = 1.0, top_p: float = 1.0):
+    def act(self, prompt_texts: list, group_size: int, max_new_tokens: int = 256,
+            temperature: float = 1.0, top_p: float = 1.0, score: bool = True):
         """Sample `group_size` completions per prompt and capture old_logp per token.
 
+        Prompts are strings, or token-id lists for a later turn of an episode: those are
+        used as-is, so the sampled tokens of earlier turns are never re-tokenized.
         Generation (KV-bound) uses the large `gen_batch`; scoring (logits-bound) uses
         `micro_batch` sub-chunks. old_logp comes from the same `_seq_logprobs` at the same
-        temperature the update uses, so the ratio is 1 on inner-epoch 0.
+        temperature the update uses, so the ratio is 1 on inner-epoch 0 up to bf16 rounding
+        at a different GEMM shape. score=False skips that forward (old_logp is zeros) for
+        callers that score the batch themselves (train.score_batch) or only need tokens.
         """
         from core import Trajectory
 
@@ -275,16 +308,19 @@ class HFPolicy(nn.Module):
         expanded = [p for p in prompt_texts for _ in range(group_size)]
         trajs = []
         with self._eval_mode():
-            return self._act_batches(expanded, max_new_tokens, temperature, temp, top_p, trajs)
+            return self._act_batches(expanded, max_new_tokens, temperature, temp, top_p, trajs,
+                                     score)
 
-    def _act_batches(self, expanded, max_new_tokens, temperature, temp, top_p, trajs):
+    def _act_batches(self, expanded, max_new_tokens, temperature, temp, top_p, trajs, score):
         """act()'s body, split out so the whole thing (generation AND the old_logp scoring
         forward) runs under _eval_mode."""
         from core import Trajectory
         for i in range(0, len(expanded), self.gen_batch):
             chunk = expanded[i : i + self.gen_batch]
             self.tok.padding_side = "left"
-            enc = self.tok(chunk, return_tensors="pt", padding=True, add_special_tokens=False)
+            ids = [self.tok(p, add_special_tokens=False).input_ids if isinstance(p, str)
+                   else list(p) for p in chunk]
+            enc = self.tok.pad({"input_ids": ids}, return_tensors="pt")
             enc = {k: v.to(self.device) for k, v in enc.items()}
             in_len = enc["input_ids"].shape[1]
             with self._autocast():
@@ -315,7 +351,8 @@ class HFPolicy(nn.Module):
                 padded[b, : f.shape[0]] = f
             logp_chunk = torch.cat([
                 self._seq_logprobs(padded[j : j + self.micro_batch].to(self.device), temp).cpu()
-                for j in range(0, padded.shape[0], self.micro_batch)], dim=0)
+                for j in range(0, padded.shape[0], self.micro_batch)], dim=0) if score \
+                else torch.zeros(padded.shape)
             for b, (full, m) in enumerate(zip(fulls, masks)):
                 trajs.append(Trajectory(states=full, actions=full.clone(),
                                         old_logp=logp_chunk[b, : full.shape[0]],

@@ -1,0 +1,48 @@
+# Multi-turn Countdown on one 80GB GPU. The calculator answers every wrong attempt
+# ("4*5+2 = 22, not 23. Try again.") until the episode is solved or max_turns run out.
+# The episode is one sequence (prompt, turn, reply, turn, ...); only the model's turns are
+# trained, all with the episode's GRPO advantage.
+#   python train.py --config configs/countdown_multiturn.yaml
+# 1x H100, 126 min: held-out solved-within-3-turns 0.477 -> 0.625 by step 10, peak 0.680
+# (step 50), 0.625 at 60; first attempt 0.469 -> 0.594-0.664. Almost all of it is a better
+# first attempt: acc - acc_turn1 went 0.008 -> 0.008-0.039, inside this eval's resolution.
+# ratio 1.000 and clipfrac 0.000 every step. CSV: results/countdown_multiturn_1xh100.csv.
+task: countdown
+algo: grpo
+model: Qwen/Qwen3-8B
+max_turns: 3           # eval logs acc (solved by the last turn) and acc_turn1 (first attempt)
+
+n_prompts: 32
+group_size: 4          # 128 episodes/step. dead groups averaged 0.6-0.8: the reward ignores
+                       # which turn solved it, so groups that all solve eventually are dead.
+                       # A larger group or a per-turn discount are the untested levers
+micro_batch: 4         # scoring: logits-bound, and a 3-turn transcript is ~3x a single turn
+gen_batch: 128         # one generate() per turn for the whole batch
+
+lora: true
+lora_r: 32
+grad_ckpt: true
+dtype: bfloat16
+device: cuda
+
+steps: 61
+inner_epochs: 1
+lr: 5.0e-5
+warmup_steps: 10
+eps: 0.2
+kl_coef: 0.0
+length_norm: true
+norm_std: true
+max_new_tokens: 512    # per turn. Under --vllm, --vllm-max-len caps the whole transcript: an
+                       # episode ends early once its next prompt would not fit (4096 is ample)
+temperature: 0.8
+top_p: 1.0
+think: false
+
+seed: 0
+eval_every: 10
+eval_n: 128
+ckpt_every: 0
+n_examples: 20000
+debug_samples: 2
+out: runs/countdown_multiturn

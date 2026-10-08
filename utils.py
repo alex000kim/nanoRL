@@ -118,12 +118,14 @@ def whiten(x: torch.Tensor, mask: torch.Tensor, eps: float = 1e-8) -> torch.Tens
 # credit assignment — return-to-go and GAE (right-padded [N, T] tensors)
 # --------------------------------------------------------------------------- #
 def discounted_returns(rewards: torch.Tensor, mask: torch.Tensor, gamma: float) -> torch.Tensor:
-    """Return-to-go per row: sum_{k>=t} gamma^{k-t} r_k. Right-padded tails contribute 0."""
+    """Return-to-go per row: sum over decision steps k>=t of gamma^(#steps between) r_k.
+    Masked-out steps carry the return through undiscounted: an env reply between two
+    assistant turns is not a decision, and right-padded tails stay 0."""
     T = rewards.shape[-1]
     returns = torch.zeros_like(rewards)
     running = torch.zeros_like(rewards[..., 0])
     for t in reversed(range(T)):
-        running = rewards[..., t] + gamma * running * mask[..., t]
+        running = torch.where(mask[..., t] > 0, rewards[..., t] + gamma * running, running)
         returns[..., t] = running
     return returns * mask
 

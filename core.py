@@ -61,7 +61,7 @@ class Batch:
     # [N, T] logprobs as reported by whatever engine actually SAMPLED these tokens. Never
     # old_logp (different kernels, different numerics — that is the bug recompute_old_logp
     # exists to prevent); it is the true behaviour policy, which is what --tis-clip corrects
-    # against. None in sync mode, where sampling and scoring share one forward.
+    # against. None in sync mode, which keeps no sampler logprobs: the trainer is the sampler.
     sample_logp: torch.Tensor | None = None
     truncated: torch.Tensor | None = None  # [N] 1.0 where generation hit the token budget
 
